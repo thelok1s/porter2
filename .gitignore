@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Env / secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Private local modules — deployment-specific, NOT part of the reusable core.
+# These are mounted at runtime by the module loader. See local/README.md.
+local/*
+!local/README.md
+!local/.example/
+
+# Runtime data
+logs/
+*.log
+db/*.sqlite
+db/*.sqlite-journal
+uploads/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
