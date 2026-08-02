@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "init": "tsx src/scripts/initdb.ts",
-    "prune": "tsx src/scripts/prunedb.ts"
+    "prune": "tsx src/scripts/prunedb.ts",
+    "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59"
   },
   "dependencies": {
     "cors": "^2.8.5",

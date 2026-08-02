@@ -73,6 +73,32 @@ Committed modules live under `src/`; private, deployment-specific ones under
 `local/` (gitignored). **New features never need to touch the Porter repost
 logic** — add a module and it's picked up automatically.
 
+## Moderation via Mini App
+
+Submission moderation happens in the Telegram Mini App, not inline buttons:
+
+1. A new submission posts a moderation message to `MODERATION_CHAT_ID` with a
+   single **web_app** button (`📝 Модерировать в Mini App`) deep-linking to
+   `${TMA_PUBLIC_URL}/moderate?id=<submissionId>`.
+2. The Mini App (`frontend/src/app/moderate/page.tsx`) reuses the announcement
+   editor — prefilled from the submission and editable — plus an action block
+   (**Опубликовать сейчас / Запланировать / Отклонить**) and brief cards of the
+   already-postponed VK queue.
+3. Moderator identity is verified: the Mini App sends raw Telegram `initData`,
+   and the backend validates it (HMAC `WebAppData` + bot token) in
+   `local/frontend/auth.ts`. The shared `x-api-key` is no longer trusted alone.
+
+Relevant endpoints (under `/api/submissions`): `GET /:id`, `PATCH /:id` (edit),
+`GET /postponed`, and `POST /:id/{approve,schedule,decline}` (each requires a
+valid `x-telegram-init-data` header).
+
+Set `TMA_PUBLIC_URL` (porter2 env) to the Mini App's public HTTPS URL — Telegram
+requires valid HTTPS for `web_app` buttons.
+
+> Dev caveat: the mock `initData` has no valid signature, so moderation
+> *actions* return 401 in the mocked browser. Test the full flow by opening the
+> Mini App from Telegram (real `initData`).
+
 ## Getting started
 
 ```bash

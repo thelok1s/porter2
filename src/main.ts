@@ -35,6 +35,21 @@ async function main(): Promise<void> {
   // Populate bot.botInfo early so /api/status can report it before/without polling.
   await bot.init();
 
+  // Register the Mini App as the default menu button so moderators can open it
+  // directly from the bot's private chat (gives full Telegram Web App context,
+  // unlike the plain url button used in the group moderation message).
+  const tmaUrl = (process.env.TMA_PUBLIC_URL ?? "").replace(/\/$/, "");
+  if (tmaUrl) {
+    try {
+      await bot.api.setChatMenuButton({
+        menu_button: { type: "web_app", text: "🖥 Модерация", web_app: { url: tmaUrl } },
+      });
+      logger.info(`[bot] Menu button set → ${tmaUrl}`);
+    } catch (err) {
+      logger.warn(`[bot] Could not set menu button: ${String(err)}`);
+    }
+  }
+
   // Central error handler for any update that throws.
   bot.catch((err) => {
     const { ctx } = err;
