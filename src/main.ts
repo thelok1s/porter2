@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   if (tmaUrl) {
     try {
       await bot.api.setChatMenuButton({
-        menu_button: { type: "web_app", text: "🖥 Модерация", web_app: { url: tmaUrl } },
+        menu_button: { type: "web_app", text: "Модерация", web_app: { url: tmaUrl } },
       });
       logger.info(`[bot] Menu button set → ${tmaUrl}`);
     } catch (err) {
