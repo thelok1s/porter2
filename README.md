@@ -31,8 +31,10 @@ src/
     api.ts             vk-io clients + Telegram identifiers
     module-loader.ts   mounts modules + runs init/start/stop lifecycle hooks
     utils.ts           text helpers (byte/char-safe truncation, VK→HTML)
+    participants.ts    full chat member lists over MTProto (Bot API can't)
     logger.ts          pino (with secret redaction)
   lib/sequelize.ts     SQLite + Sequelize bootstrap
+  lib/mtproto.ts       optional mtcute client (second, read-only authorization)
   models/              Post, Reply, Submission, User (Sequelize)
   porter/              the tg-vk crossposting/crosscommenting MODULE (committed core)
     posts.ts             VK → TG posts
@@ -44,7 +46,7 @@ src/
   types/ utils/ scripts/
 local/                PRIVATE modules (gitignored — deployment-specific)
   frontend/             Express API + moderation callbacks (serves the TMA)
-  all-command/          /all + @all admin command
+  all-command/          /all + @all admin command (tags the whole roster)
   README.md             module contract (committed)
   .example/             sample module (committed)
 porter.config.ts        feature flags + per-module config
@@ -110,3 +112,34 @@ npm start                  # tsx src/main.ts   (or: npm run start:bun)
 
 Required env: `VK_TOKEN`, `TELEGRAM_TOKEN`, `TELEGRAM_CHANNEL_ID`,
 `TELEGRAM_CHANNEL_PUBLIC_LINK`, `TELEGRAM_CHAT_ID`.
+
+### MTProto (optional)
+
+The Bot API has no way to list a chat's members — `getChatAdministrators` is
+the closest it gets. `src/lib/mtproto.ts` opens a second, read-only MTProto
+authorization ([mtcute](https://mtcute.dev)) and `src/core/participants.ts`
+exposes the real roster to any module that wants it. Both degrade to `null`
+when MTProto is off, so nothing depends on it being configured.
+
+```bash
+# 1. Register an app at https://my.telegram.org/apps, then:
+MTPROTO_API_ID=...
+MTPROTO_API_HASH=...
+```
+
+That alone is enough: the client signs in with `TELEGRAM_TOKEN`, which works
+as long as **the bot is an administrator** of the chats being enumerated.
+Where that isn't possible, sign in a user account instead and put the printed
+string in `MTPROTO_SESSION`:
+
+```bash
+npm run mtlogin
+```
+
+Calls are wrapped in `invokeWithoutUpdates` and no updates manager is created,
+so this authorization never competes with grammY's long polling.
+
+> mtcute ships one package per runtime and both are dependencies:
+> `@mtcute/node` (better-sqlite3, which Bun cannot dlopen) and `@mtcute/bun`
+> (`bun:sqlite`). `src/lib/mtproto.ts` picks one at runtime via dynamic import,
+> so `npm start` and `npm run start:bun` both work.

@@ -21,8 +21,37 @@ const topicRaw = process.env.MODERATION_TOPIC_ID;
 const moderationTopicId =
   topicRaw && Number.isFinite(Number(topicRaw)) ? Number(topicRaw) : undefined;
 
+// MTProto is opt-in and self-describing: supplying credentials turns it on.
+// Without api_id/api_hash there is nothing to connect with, so the whole
+// section collapses to `{ enabled: false }` and callers fall back.
+// `??` is the wrong operator for these: a key that is present but blank in
+// .env reads as "" rather than undefined, which would sail past a nullish
+// fallback (a blank MTPROTO_SESSION_FILE once resolved to the working
+// *directory*, which SQLite reports as "unable to open database file").
+const str = (v: string | undefined, fallback = ""): string =>
+  (v ?? "").trim() || fallback;
+
+const mtprotoApiId = num(process.env.MTPROTO_API_ID, 0);
+const mtprotoApiHash = str(process.env.MTPROTO_API_HASH);
+const mtprotoSession = str(process.env.MTPROTO_SESSION);
+
 const PorterConfig: Config = {
   loggingLevel: "debug",
+
+  mtproto:
+    mtprotoApiId > 0 && mtprotoApiHash !== ""
+      ? {
+          enabled: true,
+          apiId: mtprotoApiId,
+          apiHash: mtprotoApiHash,
+          session: mtprotoSession || undefined,
+          botToken: process.env.TELEGRAM_TOKEN,
+          storagePath: str(
+            process.env.MTPROTO_SESSION_FILE,
+            "./db/mtproto.session",
+          ),
+        }
+      : { enabled: false },
 
   crossposting: {
     enabled: true,

@@ -1,5 +1,35 @@
 export interface Config {
   loggingLevel: "debug" | "info" | "warn" | "error";
+  /**
+   * A second, MTProto-level authorization used for the things the Bot API
+   * simply does not expose — most notably enumerating every member of a
+   * supergroup. Optional: every consumer must degrade gracefully when this is
+   * disabled or temporarily unreachable.
+   */
+  mtproto?:
+    | {
+        enabled: true;
+        /** api_id from my.telegram.org. */
+        apiId: number;
+        /** api_hash from my.telegram.org. */
+        apiHash: string;
+        /**
+         * User-account session string (see `npm run mtlogin`). Preferred over
+         * `botToken`: a user account can read member lists without being an
+         * administrator, and never competes for the bot's update queue.
+         */
+        session?: string;
+        /**
+         * Bot token, used when no session string is supplied. The bot must be
+         * an administrator of every chat it is asked about.
+         */
+        botToken?: string;
+        /** SQLite file holding the auth key and the peer cache. */
+        storagePath: string;
+      }
+    | {
+        enabled: false;
+      };
   crossposting: {
     enabled: boolean;
     origin: "vk" | "tg" | "both";

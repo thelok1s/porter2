@@ -9,6 +9,7 @@ import {
   startModules,
   stopModules,
 } from "@/core/module-loader";
+import { closeMtproto, getMtprotoClient, isMtprotoConfigured } from "@/lib/mtproto";
 import { appFiglet } from "@/utils/appFiglet";
 import logger from "@/lib/logger";
 
@@ -34,6 +35,13 @@ async function main(): Promise<void> {
 
   // Populate bot.botInfo early so /api/status can report it before/without polling.
   await bot.init();
+
+  // Connect the optional MTProto client up front so a bad session or revoked
+  // token shows up in the boot log rather than in the middle of a command.
+  // Failure is logged inside and leaves the capability simply unavailable.
+  if (isMtprotoConfigured()) {
+    await getMtprotoClient();
+  }
 
   // Register the Mini App as the default menu button so moderators can open it
   // directly from the bot's private chat (gives full Telegram Web App context,
@@ -104,6 +112,7 @@ async function shutdown(signal: string): Promise<void> {
   try {
     bot.stop();
     await stopModules(); // LIFO: frontend → porter → all-command
+    await closeMtproto();
     await closeDatabase();
   } catch (error) {
     logger.error(`[shutdown] error: ${String(error)}`);

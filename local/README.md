@@ -33,7 +33,10 @@ never breaks startup.
 - `frontend/` — Express API server + TMA bridge that the Next.js frontend talks
   to (submissions, posts, send, stats, health, image uploads). Replaces the old
   `porter/src/api/` server.
-- `all-command/` — `/all` and `@all` admin mention command, admin-gated.
+- `all-command/` — `/all` and `@all` admin mention command, admin-gated. Tags
+  the chat's full roster, read live from the framework's MTProto capability
+  (`@/core/participants`) and nowhere else — no local member table, no watching
+  messages, so it is unaffected by the bot's privacy mode.
 
 ## Adding a module
 

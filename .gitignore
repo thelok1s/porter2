@@ -22,8 +22,16 @@ logs/
 db/*.sqlite
 db/*.sqlite-journal
 uploads/
+*.sqlite
+
+# MTProto session — an auth key in a SQLite file. Committing it hands over the
+# account it was signed in with, so match the WAL sidecars too.
+*.session
+*.session-shm
+*.session-wal
 
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
+docs/specs/

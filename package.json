@@ -14,10 +14,14 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "init": "tsx src/scripts/initdb.ts",
+    "mtlogin": "tsx src/scripts/mtlogin.ts",
     "prune": "tsx src/scripts/prunedb.ts",
     "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59"
   },
   "dependencies": {
+    "@mtcute/bun": "^0.31.0",
+    "@mtcute/core": "^0.31.0",
+    "@mtcute/node": "^0.31.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
