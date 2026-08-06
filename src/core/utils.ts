@@ -72,8 +72,10 @@ function convertVkLinksToHtml(text: string): string {
     /\[#(?<alias>[^[|]+)\|(?<url1>[^|]+)\|(?<url2>[^\]]+)]/g;
 
   const vkIdPattern = /^(id|club)\d+$/;
+  // Accept any VK host mirror (vk.com / vk.ru / vk.me). Links are emitted on
+  // vk.ru (see getVkLink / replies), but inbound text may carry any of them.
   const vkLinkPattern =
-    /^(https?:\/\/)?(m\.)?vk\.com(\/[\w\-.~:/?#[\]@&()*+,;%="ёЁа-яА-Я]*)?$/;
+    /^(https?:\/\/)?(?:www\.|m\.)?vk\.(?:com|ru|me)(\/[\w\-.~:/?#[\]@&()*+,;%="ёЁа-яА-Я]*)?$/;
 
   let safeText = text
     .replace(/&/g, "&amp;")
@@ -95,7 +97,7 @@ function convertVkLinksToHtml(text: string): string {
 
   safeText = safeText.replace(linkPattern, (_match, url, title) => {
     if (vkIdPattern.test(url)) {
-      url = `https://vk.com/${url}`;
+      url = `https://vk.ru/${url}`;
     }
 
     if (vkLinkPattern.test(url)) {
@@ -128,7 +130,7 @@ function formatMessageText(text: string, useHtml: boolean = true): string {
 }
 
 function getVkLink(id: number, ownerId: number): string {
-  return `https://vk.com/wall${ownerId}_${id}`;
+  return `https://vk.ru/wall${ownerId}_${id}`;
 }
 
 export {

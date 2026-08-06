@@ -217,7 +217,7 @@ export default async function replyToTelegram(reply: CommentContext): Promise<vo
       const sender = await resolveSender(reply.fromId);
       const processedText = formatMessageText(reply.text || "");
       const authorLink = getHtmlLink(
-        `https://www.vk.com/id${sender.id}`,
+        `https://vk.ru/id${sender.id}`,
         `${sender.first_name} ${sender.last_name}`.trim(),
       );
       const messageText = `${authorLink}: ${processedText}`;
@@ -330,7 +330,7 @@ export default async function replyToTelegram(reply: CommentContext): Promise<vo
       const sender = await resolveSender(reply.fromId);
       const processedText = formatMessageText(reply.text || "");
       const authorLink = getHtmlLink(
-        `https://www.vk.com/id${sender.id}`,
+        `https://vk.ru/id${sender.id}`,
         `${sender.first_name} ${sender.last_name}`.trim(),
       );
       const messageText = `${authorLink}: ${processedText}`;

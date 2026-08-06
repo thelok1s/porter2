@@ -22,6 +22,7 @@ logs/
 db/*.sqlite
 db/*.sqlite-journal
 uploads/
+data/
 *.sqlite
 
 # MTProto session — an auth key in a SQLite file. Committing it hands over the
