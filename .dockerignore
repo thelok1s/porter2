@@ -1,0 +1,25 @@
+# Build context excludes — keep the image small and keep secrets/DB out.
+node_modules
+**/node_modules
+dist
+.git
+.gitignore
+
+# Secrets — never bake these into the image (mounted at runtime instead).
+.env
+.env.*
+!.env.example
+
+# Local runtime state — mounted as volumes, not copied.
+db/*.sqlite
+db/*.sqlite-*
+db/*.session
+db/*.session-*
+uploads/*
+logs/*
+
+# Docs/examples not needed at runtime.
+docs
+README.md
+eslint.config.js
+.prettierignore
