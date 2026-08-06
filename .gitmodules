@@ -1,0 +1,6 @@
+[submodule "local/all-command"]
+	path = local/all-command
+	url = https://github.com/thelok1s/porter2-all-command.git
+[submodule "local/frontend"]
+	path = local/frontend
+	url = https://github.com/thelok1s/porter2-frontend-api.git

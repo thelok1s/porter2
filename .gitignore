@@ -11,10 +11,14 @@ dist/
 .env.*.local
 
 # Private local modules — deployment-specific, NOT part of the reusable core.
-# These are mounted at runtime by the module loader. See local/README.md.
+# `all-command` and `frontend` are tracked as private git submodules (see
+# .gitmodules); everything else under local/ stays gitignored and is mounted at
+# runtime by the module loader. See local/README.md.
 local/*
 !local/README.md
 !local/.example/
+!local/all-command
+!local/frontend
 
 # Runtime data
 logs/
