@@ -16,14 +16,6 @@ if (!process.env.VK_TOKEN) {
 export const vkGroupApi = new VK({ token: process.env.VK_TOKEN });
 export const vkGlobalApi = new API({ token: process.env.VK_TOKEN });
 
-export function getVkUserApi(): API | null {
-  const userToken = process.env.VK_USER_TOKEN;
-  if (userToken && userToken.trim().length > 0) {
-    return new API({ token: userToken.trim() });
-  }
-  return null;
-}
-
 // Telegram identifiers (validated comprehensively in main.ts).
 export const tgChannelId = process.env.TELEGRAM_CHANNEL_ID!;
 export const tgChatId = process.env.TELEGRAM_CHAT_ID!;
