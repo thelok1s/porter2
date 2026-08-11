@@ -167,19 +167,32 @@ interface Outcome {
   uploaded: boolean;
   posted: boolean;
   attachmentSurvived: boolean;
+  /** Posted, but VK would not let us read it back — a human must eyeball it. */
+  needsManualCheck?: boolean;
+  postId?: number;
   note: string;
 }
 
 /**
- * Post `attachments` as a postponed entry, read it back to confirm VK really
- * kept the photo, then delete it. A post that VK accepts but silently strips
- * the attachment from is a FAILURE — reading back is the only way to tell the
- * difference, and is precisely the check the previous fix lacked.
+ * Post `attachments` as a postponed entry, try to read it back, then try to
+ * delete it.
+ *
+ * CAVEAT learned the hard way: `wall.getById` and `wall.delete` are themselves
+ * unavailable with group auth (Code 27), even though `wall.post` is fine. So a
+ * failed read-back says nothing about the attachment — it only means we cannot
+ * look. Such a run reports `needsManualCheck` rather than a false negative, and
+ * the post survives in Отложенные записи for a human to inspect and remove.
  */
 async function postVerifyDelete(
   strategy: string,
   attachments: string,
-): Promise<{ posted: boolean; survived: boolean; note: string }> {
+): Promise<{
+  posted: boolean;
+  survived: boolean;
+  needsManualCheck: boolean;
+  postId?: number;
+  note: string;
+}> {
   const publishDate = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
   let postId: number | undefined;
 
@@ -192,10 +205,18 @@ async function postVerifyDelete(
     });
     postId = res.post_id;
   } catch (e) {
-    return { posted: false, survived: false, note: `wall.post — ${errText(e)}` };
+    // VK rejects an attachment it dislikes right here, loudly (e.g. code 100
+    // "No photo given"). Accepting the post is therefore real evidence.
+    return {
+      posted: false,
+      survived: false,
+      needsManualCheck: false,
+      note: `wall.post — ${errText(e)}`,
+    };
   }
 
   let survived = false;
+  let needsManualCheck = false;
   let note = `posted #${postId}`;
   try {
     const got = (await api.wall.getById({
@@ -212,16 +233,20 @@ async function postVerifyDelete(
       ? `photo attached (${kinds.join(", ")})`
       : `VK STRIPPED it — attachments: [${kinds.join(", ") || "none"}]`;
   } catch (e) {
-    note = `posted #${postId} but read-back failed — ${errText(e)}`;
+    needsManualCheck = true;
+    note =
+      `wall.post ACCEPTED the attachment (post #${postId}), but read-back is ` +
+      `blocked — ${errText(e)}`;
   }
 
   try {
     if (postId) await api.wall.delete({ owner_id: OWNER_ID, post_id: postId });
-  } catch (e) {
-    note += ` (cleanup failed, delete #${postId} by hand — ${errText(e)})`;
+  } catch {
+    needsManualCheck = true;
+    note += ` — delete #${postId} by hand (wall.delete is group-auth blocked)`;
   }
 
-  return { posted: true, survived, note };
+  return { posted: true, survived, needsManualCheck, postId, note };
 }
 
 // ── strategies ──────────────────────────────────────────────────────────────
@@ -280,9 +305,13 @@ async function viaMessagesUploadServer(
       uploaded: true,
       posted: r.posted,
       attachmentSurvived: r.survived,
+      needsManualCheck: r.needsManualCheck,
+      postId: r.postId,
       note: r.note,
     });
-    if (r.survived) break; // first win is enough; stop touching the wall
+    // Stop on a win OR on an unverifiable post: a second variant would only
+    // leave another undeletable entry in Отложенные записи for no new signal.
+    if (r.survived || r.needsManualCheck) break;
   }
   return results;
 }
@@ -409,16 +438,31 @@ async function main() {
 
   console.log("\n──────── summary ────────");
   for (const r of results) {
-    const verdict = r.attachmentSurvived ? "✅ WORKS" : "❌ no";
+    const verdict = r.attachmentSurvived
+      ? "✅ WORKS"
+      : r.needsManualCheck
+        ? "⚠ LIKELY — verify by eye"
+        : "❌ no";
     console.log(`${verdict}  ${r.strategy}\n        ${r.note}`);
   }
 
   const winner = results.find((r) => r.attachmentSurvived);
-  console.log(
-    winner
-      ? `\nUse: ${winner.strategy}`
-      : "\nNo strategy attached a photo. A user token is then the only remaining route — report this output.",
-  );
+  const pending = results.filter((r) => r.needsManualCheck);
+
+  if (winner) {
+    console.log(`\nUse: ${winner.strategy}`);
+  } else if (pending.length) {
+    const ids = pending.map((r) => `#${r.postId}`).join(", ");
+    console.log(
+      `\nVK accepted the attachment but blocks read-back with group auth, so ` +
+        `this cannot be settled from here.\nOpen the community → Отложенные ` +
+        `записи, check whether ${ids} shows the image, then DELETE ${ids}.`,
+    );
+  } else {
+    console.log(
+      "\nNo strategy attached a photo. A user token is then the only remaining route — report this output.",
+    );
+  }
 }
 
 main().catch((err) => {
