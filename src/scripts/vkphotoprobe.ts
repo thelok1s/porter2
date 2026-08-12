@@ -16,13 +16,19 @@ dotenv.config();
  * A user token was ruled out, and appending a bare image URL to the message did
  * not render a preview.
  *
- * The remaining seam: photos.getMessagesUploadServer and
- * photos.saveMessagesPhoto BOTH explicitly document community-token support
- * (`ключ доступа сообщества`, rights: photos), and saveMessagesPhoto returns an
- * `access_key` — the token VK uses to reference media that is not publicly
- * listed, attachable as `photo{owner_id}_{id}_{access_key}`. Whether VK lets a
- * messages-photo ride on a WALL post is exactly the thing no documentation
- * states, so this script asks VK instead of guessing.
+ * Ruled out so far:
+ *   • upload.wallPhoto — Code 27, user-token-only (the --control strategy).
+ *   • messages upload server — the upload SUCCEEDS with a community token and
+ *     wall.post accepts the attachment, but VK silently strips it: those photos
+ *     live in album -3, which wall posts may not reference. Behind --messages.
+ *   • a bare image URL in `attachments` — code 100 "No photo given", because VK
+ *     scrapes og:image from an HTML page and a .png carries no metadata.
+ *
+ * Still open, and what this script now tests:
+ *   • docs.getWallUploadServer — documents community-token support (rights:
+ *     docs) and uploads into the WALL context rather than the messages album.
+ *   • the /api/images/<file>/card Open Graph page, which gives VK's scraper the
+ *     og:image it wanted. Wider than 537px renders as a large snippet.
  *
  * Every strategy is tested against the real wall as a POSTPONED post (publish
  * date a week out), read back to see whether the attachment actually survived,
@@ -316,6 +322,47 @@ async function viaMessagesUploadServer(
   return results;
 }
 
+/**
+ * Upload the image as a DOCUMENT via the wall document server.
+ *
+ * docs.getWallUploadServer documents community-token support (rights: docs),
+ * and unlike the messages photo server it uploads into the WALL context — so
+ * the result is not stuck in the messages album (-3) that VK strips from posts.
+ */
+async function viaWallDocument(source: Buffer | string): Promise<Outcome> {
+  const strategy = "wall-document";
+  let doc;
+  try {
+    doc = await vk.upload.wallDocument({
+      source: { value: source as never },
+      group_id: GROUP_ID,
+    });
+  } catch (e) {
+    return {
+      strategy,
+      uploaded: false,
+      posted: false,
+      attachmentSurvived: false,
+      note: `upload failed — ${errText(e)}`,
+    };
+  }
+
+  const d = doc as unknown as { ownerId: number; id: number };
+  console.log(`  uploaded doc: owner=${d.ownerId} id=${d.id}`);
+  const attach = `doc${d.ownerId}_${d.id}`;
+  console.log(`  → posting ${attach}`);
+  const r = await postVerifyDelete(strategy, attach);
+  return {
+    strategy,
+    uploaded: true,
+    posted: r.posted,
+    attachmentSurvived: r.survived,
+    needsManualCheck: r.needsManualCheck,
+    postId: r.postId,
+    note: r.note,
+  };
+}
+
 /** Control: confirm the Code 27 wall is still there and we are not chasing a ghost. */
 async function viaWallUploadServer(source: Buffer | string): Promise<Outcome> {
   const strategy = "wall-upload-server (control)";
@@ -421,19 +468,35 @@ async function main() {
 
   const results: Outcome[] = [];
 
-  console.log("[1] messages upload server (the candidate)");
-  results.push(...(await viaMessagesUploadServer(source)));
-
-  console.log("\n[2] wall upload server (control — expected Code 27)");
-  results.push(await viaWallUploadServer(source));
+  console.log("[1] wall document server (candidate)");
+  results.push(await viaWallDocument(source));
 
   if (URL_ARG) {
-    console.log("\n[3] link attachment from a public URL");
-    results.push(await viaLinkAttachment(URL_ARG));
+    // A raw image URL has no og:image, which is why VK answered "No photo
+    // given" before. The /card route wraps it in an Open Graph page, so test
+    // that — falling back to the URL as given if it already points at a page.
+    const cardUrl = /\.(png|jpe?g|webp)$/i.test(URL_ARG)
+      ? `${URL_ARG}/card`
+      : URL_ARG;
+    console.log(`\n[2] link attachment via Open Graph card\n  ${cardUrl}`);
+    results.push(await viaLinkAttachment(cardUrl));
   } else {
     console.log(
-      "\n[3] link attachment — skipped (pass --url <public image or page URL>)",
+      "\n[2] link attachment — skipped (pass --url <public image URL>)",
     );
+  }
+
+  if (process.argv.includes("--messages")) {
+    // Disproven on 2026-08-11: the upload succeeds and wall.post accepts the
+    // attachment, but VK silently strips it — messages photos live in album -3,
+    // which wall posts may not reference. Kept behind a flag for re-testing.
+    console.log("\n[3] messages upload server (known to be stripped)");
+    results.push(...(await viaMessagesUploadServer(source)));
+  }
+
+  if (process.argv.includes("--control")) {
+    console.log("\n[4] wall upload server (control — expected Code 27)");
+    results.push(await viaWallUploadServer(source));
   }
 
   console.log("\n──────── summary ────────");
