@@ -205,6 +205,10 @@ async function postVerifyDelete(
   try {
     const res = await api.wall.post({
       owner_id: OWNER_ID,
+      // Defaults to 0 = "publish as the user". A post authored by a person
+      // cannot carry media owned by the community, which is the leading
+      // explanation for VK accepting an attachment and then dropping it.
+      from_group: 1,
       message: `probe: ${strategy} — postponed, auto-deleted`,
       attachments,
       publish_date: publishDate,
@@ -468,7 +472,13 @@ async function main() {
 
   const results: Outcome[] = [];
 
-  console.log("[1] wall document server (candidate)");
+  // Retested as the prime candidate now that posts carry from_group=1: the
+  // earlier strip happened while posts were authored by a user, which cannot
+  // legally reference community-owned media.
+  console.log("[1] messages upload server (retest with from_group=1)");
+  results.push(...(await viaMessagesUploadServer(source)));
+
+  console.log("\n[2] wall document server (candidate)");
   results.push(await viaWallDocument(source));
 
   if (URL_ARG) {
@@ -478,20 +488,12 @@ async function main() {
     const cardUrl = /\.(png|jpe?g|webp)$/i.test(URL_ARG)
       ? `${URL_ARG}/card`
       : URL_ARG;
-    console.log(`\n[2] link attachment via Open Graph card\n  ${cardUrl}`);
+    console.log(`\n[3] link attachment via Open Graph card\n  ${cardUrl}`);
     results.push(await viaLinkAttachment(cardUrl));
   } else {
     console.log(
-      "\n[2] link attachment — skipped (pass --url <public image URL>)",
+      "\n[3] link attachment — skipped (pass --url <public image URL>)",
     );
-  }
-
-  if (process.argv.includes("--messages")) {
-    // Disproven on 2026-08-11: the upload succeeds and wall.post accepts the
-    // attachment, but VK silently strips it — messages photos live in album -3,
-    // which wall posts may not reference. Kept behind a flag for re-testing.
-    console.log("\n[3] messages upload server (known to be stripped)");
-    results.push(...(await viaMessagesUploadServer(source)));
   }
 
   if (process.argv.includes("--control")) {
