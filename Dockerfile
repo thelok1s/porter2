@@ -37,7 +37,10 @@ COPY src ./src
 COPY local ./local
 
 # Persistent state lives here; created so the mount targets always exist.
-RUN mkdir -p db uploads && chown -R porter:porter /app
+# NOTE: for BIND mounts these permissions come from the HOST directory, not from
+# this chown — a host dir owned by root leaves the container unable to write.
+# Create them as UID 1001 on the host: chown -R 1001:1001 db uploads data
+RUN mkdir -p db uploads data/images && chown -R porter:porter /app
 
 USER porter
 
