@@ -363,13 +363,21 @@ async function viaMessagesUploadServer(
  * and unlike the messages photo server it uploads into the WALL context — so
  * the result is not stuck in the messages album (-3) that VK strips from posts.
  */
-async function viaWallDocument(source: Buffer | string): Promise<Outcome> {
+async function viaWallDocument(
+  source: Buffer | string,
+  filename = "announcement.png",
+): Promise<Outcome> {
   const strategy = "wall-document";
   let doc;
   try {
     doc = await vk.upload.wallDocument({
-      source: { value: source as never },
+      // The FILENAME decides how VK renders this. Uploading a Buffer without
+      // one produced "file0.dat": VK types a document from its extension, so a
+      // .dat is a generic blob shown as a download link, while a .png is doc
+      // type 4 (image) and renders with a preview. Same bytes, different post.
+      source: { value: source as never, filename },
       group_id: GROUP_ID,
+      title: filename,
     });
   } catch (e) {
     return {
@@ -531,7 +539,7 @@ async function main() {
   results.push(...(await viaMessagesUploadServer(source)));
 
   console.log("\n[2] wall document server (candidate)");
-  results.push(await viaWallDocument(source));
+  results.push(await viaWallDocument(source, filename ?? "announcement.png"));
 
   if (imageUrl) {
     // A raw image URL has no og:image, which is why VK answered "No photo
