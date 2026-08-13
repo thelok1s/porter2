@@ -28,6 +28,13 @@ services:
       - ./db:/app/db
       # Uploaded images served at ${PORTER_PUBLIC_URL}/uploads/*
       - ./uploads:/app/uploads
+      # Announcement images served at ${PORTER_PUBLIC_URL}/api/images/*.
+      # Published VK and Telegram posts link to these URLs forever, so the store
+      # MUST outlive the container — unmounted, /app/data/images is wiped by
+      # every rebuild and every one of those links 404s. This is the same
+      # ephemeral-storage trap that moved image hosting off Vercel in the first
+      # place; the "[images] created image store" line on each boot is the tell.
+      - ./data:/app/data
     healthcheck:
       # /health is unauthenticated and returns JSON {status:"ok"}.
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5050/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
