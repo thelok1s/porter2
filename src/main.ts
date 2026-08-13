@@ -1,4 +1,3 @@
-import dns from "node:dns";
 import dotenv from "dotenv";
 import { session } from "grammy";
 import { GrammyError } from "grammy";
@@ -13,23 +12,6 @@ import {
 import { closeMtproto, getMtprotoClient, isMtprotoConfigured } from "@/lib/mtproto";
 import { appFiglet } from "@/utils/appFiglet";
 import logger from "@/lib/logger";
-
-/**
- * Resolve IPv4 before IPv6.
- *
- * Node 17+ resolves "verbatim" — it dials addresses in whatever order the
- * resolver returns them. Inside a Docker bridge network, which normally has no
- * IPv6 route, api.telegram.org answering with its AAAA record first means the
- * bot connects to an address it cannot reach. grammY treats that as a network
- * error and retries indefinitely, so `bot.init()` never returns: the process
- * stays alive, never reaches `startModules()`, and the REST API never binds to
- * 5050. The symptom is a container that is "up (unhealthy)" with a boot log
- * that stops after the last import-time line, and 502s on every /api route.
- *
- * Must run before any network call, hence above dotenv and the module imports
- * that build clients.
- */
-dns.setDefaultResultOrder("ipv4first");
 
 dotenv.config();
 

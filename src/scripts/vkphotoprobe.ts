@@ -137,7 +137,12 @@ function generatePng(width = 600, height = 400): Buffer {
 }
 
 /** Prefer a real announcement image; fall back to a generated one. */
-function resolveImage(): { source: Buffer | string; described: string } {
+function resolveImage(): {
+  source: Buffer | string;
+  described: string;
+  /** Set when the image came from the store, so its public URL is derivable. */
+  filename?: string;
+} {
   if (URL_ARG) return { source: URL_ARG, described: `url ${URL_ARG}` };
   if (IMAGE_ARG)
     return {
@@ -156,6 +161,7 @@ function resolveImage(): { source: Buffer | string; described: string } {
       return {
         source: fs.readFileSync(path.join(dir, newest.f)),
         described: `newest stored image ${newest.f}`,
+        filename: newest.f,
       };
   }
   return { source: generatePng(), described: "generated 600x400 PNG" };
@@ -167,6 +173,30 @@ const errText = (e: unknown): string => {
   const err = e as { code?: number; message?: string };
   return err?.code ? `VK code ${err.code}: ${err.message}` : String(e);
 };
+
+/**
+ * Confirm a URL actually serves something before asking VK to fetch it.
+ *
+ * A stale URL produces the SAME error as a genuine rejection — the image store
+ * was once unmounted, so old UUIDs 404, the /card page then 404s too, and VK
+ * answers "No photo given" exactly as if it had refused a valid card. That
+ * cost a full test cycle. Check first and say so, rather than recording a
+ * false negative.
+ */
+async function urlServes(
+  url: string,
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const res = await fetch(url, { redirect: "follow" });
+    const type = res.headers.get("content-type") ?? "?";
+    return {
+      ok: res.ok,
+      detail: `HTTP ${res.status}, content-type ${type}`,
+    };
+  } catch (error) {
+    return { ok: false, detail: `unreachable — ${String(error)}` };
+  }
+}
 
 interface Outcome {
   strategy: string;
@@ -467,8 +497,30 @@ async function main() {
     console.log(`token rights: could not read — ${errText(e)}`);
   }
 
-  const { source, described } = resolveImage();
-  console.log(`test image: ${described}\n`);
+  const { source, described, filename } = resolveImage();
+  console.log(`test image: ${described}`);
+
+  if (URL_ARG) {
+    const check = await urlServes(URL_ARG);
+    console.log(`source url: ${check.detail}`);
+    if (!check.ok) {
+      console.error(
+        "\nThat --url serves nothing, so every strategy would fail for that " +
+          "reason alone rather than because VK refused it. Aborting.\n" +
+          "Stored images do not survive a rebuild unless ./data is mounted, so " +
+          "old UUIDs 404. Omit --url to use the newest image on disk.",
+      );
+      process.exit(1);
+    }
+  }
+  console.log("");
+
+  // Derive the public URL from the image actually being tested instead of
+  // trusting a hand-typed UUID — a stale one silently invalidated a whole run.
+  const publicBase = (process.env.PORTER_PUBLIC_URL ?? "").replace(/\/$/, "");
+  const imageUrl =
+    URL_ARG ??
+    (filename && publicBase ? `${publicBase}/api/images/${filename}` : undefined);
 
   const results: Outcome[] = [];
 
@@ -481,18 +533,31 @@ async function main() {
   console.log("\n[2] wall document server (candidate)");
   results.push(await viaWallDocument(source));
 
-  if (URL_ARG) {
+  if (imageUrl) {
     // A raw image URL has no og:image, which is why VK answered "No photo
     // given" before. The /card route wraps it in an Open Graph page, so test
     // that — falling back to the URL as given if it already points at a page.
-    const cardUrl = /\.(png|jpe?g|webp)$/i.test(URL_ARG)
-      ? `${URL_ARG}/card`
-      : URL_ARG;
-    console.log(`\n[3] link attachment via Open Graph card\n  ${cardUrl}`);
-    results.push(await viaLinkAttachment(cardUrl));
+    const cardUrl = /\.(png|jpe?g|webp)$/i.test(imageUrl)
+      ? `${imageUrl}/card`
+      : imageUrl;
+    const check = await urlServes(cardUrl);
+    console.log(
+      `\n[3] link attachment via Open Graph card\n  ${cardUrl}\n  ${check.detail}`,
+    );
+    if (check.ok) {
+      results.push(await viaLinkAttachment(cardUrl));
+    } else {
+      results.push({
+        strategy: "link attachment",
+        uploaded: false,
+        posted: false,
+        attachmentSurvived: false,
+        note: `card page not served (${check.detail}) — inconclusive, not a VK refusal`,
+      });
+    }
   } else {
     console.log(
-      "\n[3] link attachment — skipped (pass --url <public image URL>)",
+      "\n[3] link attachment — skipped (needs --url, or PORTER_PUBLIC_URL plus a stored image)",
     );
   }
 
