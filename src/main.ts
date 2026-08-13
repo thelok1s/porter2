@@ -48,17 +48,62 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
+/**
+ * Run one startup step: announce it, bound it, and never let it hang the boot.
+ *
+ * grammY retries network errors indefinitely, so an unreachable Telegram — a
+ * missing IPv6 route, blocked egress — leaves `bot.init()` pending forever.
+ * main() then never reaches startModules(), the REST API never binds to 5050,
+ * and the container sits "up (unhealthy)" with a boot log that simply stops
+ * mid-sequence. That failure is invisible: no error, no exit code, nothing to
+ * grep. Bounding each step turns it into a logged line naming the exact call,
+ * and lets the Mini App API start with a degraded bot rather than not at all.
+ *
+ * Returns whether the step succeeded; callers decide what is fatal.
+ */
+async function step(
+  name: string,
+  run: () => Promise<unknown>,
+  timeoutMs = 20_000,
+): Promise<boolean> {
+  logger.info(`[boot] ${name}…`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      run(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+    logger.info(`[boot] ${name} — ok`);
+    return true;
+  } catch (error) {
+    logger.error(`[boot] ${name} — FAILED: ${String(error)}`);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function main(): Promise<void> {
-  await initDatabase();
+  // The only genuinely fatal step: everything downstream reads the database.
+  if (!(await step("database", () => initDatabase()))) {
+    logger.fatal("[boot] database unavailable — exiting");
+    process.exit(1);
+  }
 
   // Populate bot.botInfo early so /api/status can report it before/without polling.
-  await bot.init();
+  // Not fatal: without it the bot is degraded, but the REST API the Mini App
+  // depends on has no reason to stay down too.
+  await step("bot.init (api.telegram.org)", () => bot.init());
 
   // Connect the optional MTProto client up front so a bad session or revoked
   // token shows up in the boot log rather than in the middle of a command.
-  // Failure is logged inside and leaves the capability simply unavailable.
   if (isMtprotoConfigured()) {
-    await getMtprotoClient();
+    await step("mtproto connect", () => getMtprotoClient());
   }
 
   // Register the Mini App as the default menu button so moderators can open it
@@ -66,14 +111,12 @@ async function main(): Promise<void> {
   // unlike the plain url button used in the group moderation message).
   const tmaUrl = (process.env.TMA_PUBLIC_URL ?? "").replace(/\/$/, "");
   if (tmaUrl) {
-    try {
-      await bot.api.setChatMenuButton({
+    const ok = await step("set menu button", () =>
+      bot.api.setChatMenuButton({
         menu_button: { type: "web_app", text: "Модерация", web_app: { url: tmaUrl } },
-      });
-      logger.info(`[bot] Menu button set → ${tmaUrl}`);
-    } catch (err) {
-      logger.warn(`[bot] Could not set menu button: ${String(err)}`);
-    }
+      }),
+    );
+    if (ok) logger.info(`[bot] Menu button set → ${tmaUrl}`);
   }
 
   // Central error handler for any update that throws.
