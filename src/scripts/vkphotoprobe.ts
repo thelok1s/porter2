@@ -525,7 +525,15 @@ async function main() {
 
   // Derive the public URL from the image actually being tested instead of
   // trusting a hand-typed UUID — a stale one silently invalidated a whole run.
-  const publicBase = (process.env.PORTER_PUBLIC_URL ?? "").replace(/\/$/, "");
+  // TMA_PUBLIC_URL first: porter.prod resolves only behind the edge proxy, so a
+  // card hosted there returns 200 to THIS script and nothing to VK's crawler —
+  // which reads as "No photo given", indistinguishable from a real refusal. The
+  // Mini App host is the internet-facing one and proxies /api/images through.
+  const publicBase = (
+    process.env.TMA_PUBLIC_URL ??
+    process.env.PORTER_PUBLIC_URL ??
+    ""
+  ).replace(/\/$/, "");
   const imageUrl =
     URL_ARG ??
     (filename && publicBase ? `${publicBase}/api/images/${filename}` : undefined);
@@ -538,8 +546,15 @@ async function main() {
   console.log("[1] messages upload server (retest with from_group=1)");
   results.push(...(await viaMessagesUploadServer(source)));
 
-  console.log("\n[2] wall document server (candidate)");
-  results.push(await viaWallDocument(source, filename ?? "announcement.png"));
+  if (process.argv.includes("--docs")) {
+    // Disproven: VK refuses image files as documents ("Not Allowed" / "file is
+    // undefined" for a .png). Without an image extension the upload succeeds
+    // and the attachment even SURVIVES the post — the only one that ever did —
+    // but VK types it as a generic blob and renders "file0.dat" as a download
+    // link, never a picture. Attachable is not the same as visible.
+    console.log("\n[2] wall document server (known: file, not image)");
+    results.push(await viaWallDocument(source, filename ?? "announcement.png"));
+  }
 
   if (imageUrl) {
     // A raw image URL has no og:image, which is why VK answered "No photo
