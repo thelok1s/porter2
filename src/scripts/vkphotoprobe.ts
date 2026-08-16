@@ -185,14 +185,29 @@ const errText = (e: unknown): string => {
  */
 async function urlServes(
   url: string,
+  expectOpenGraph = false,
 ): Promise<{ ok: boolean; detail: string }> {
   try {
     const res = await fetch(url, { redirect: "follow" });
     const type = res.headers.get("content-type") ?? "?";
-    return {
-      ok: res.ok,
-      detail: `HTTP ${res.status}, content-type ${type}`,
-    };
+    let detail = `HTTP ${res.status}, content-type ${type}`;
+    if (!res.ok) return { ok: false, detail };
+
+    if (expectOpenGraph) {
+      const body = await res.text();
+      const hasImage = /property="og:image"/.test(body);
+      const hasSize = /property="og:image:width"/.test(body);
+      detail += `, og:image ${hasImage ? "yes" : "MISSING"}`;
+      detail += `, dimensions ${hasSize ? "yes" : "MISSING"}`;
+      // A container still running older code is indistinguishable from VK
+      // refusing a good card, and has already cost several test cycles.
+      if (!hasImage || !hasSize) {
+        detail +=
+          "  <- STALE BUILD? rebuild with: docker compose up -d --build";
+        return { ok: false, detail };
+      }
+    }
+    return { ok: true, detail };
   } catch (error) {
     return { ok: false, detail: `unreachable — ${String(error)}` };
   }
@@ -562,7 +577,7 @@ async function main() {
     const cardUrl = /\.(png|jpe?g|webp)$/i.test(imageUrl)
       ? `${imageUrl}/card`
       : imageUrl;
-    const check = await urlServes(cardUrl);
+    const check = await urlServes(cardUrl, true);
     console.log(
       `\n[3] link attachment via Open Graph card\n  ${cardUrl}\n  ${check.detail}`,
     );
