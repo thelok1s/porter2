@@ -525,13 +525,12 @@ async function main() {
 
   // Derive the public URL from the image actually being tested instead of
   // trusting a hand-typed UUID — a stale one silently invalidated a whole run.
-  // TMA_PUBLIC_URL first: porter.prod resolves only behind the edge proxy, so a
-  // card hosted there returns 200 to THIS script and nothing to VK's crawler —
-  // which reads as "No photo given", indistinguishable from a real refusal. The
-  // Mini App host is the internet-facing one and proxies /api/images through.
+  // PORTER_PUBLIC_URL, verified publicly reachable from outside the network.
+  // Not the Mini App host: its proxy expects JSON from porter and answers the
+  // card with {"error":"Сервер вернул HTML вместо JSON"}.
   const publicBase = (
-    process.env.TMA_PUBLIC_URL ??
     process.env.PORTER_PUBLIC_URL ??
+    process.env.TMA_PUBLIC_URL ??
     ""
   ).replace(/\/$/, "");
   const imageUrl =
