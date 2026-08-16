@@ -35,6 +35,12 @@ data/
 *.session-shm
 *.session-wal
 
+# VK ID grant — holds a REFRESH TOKEN, which is password-grade: whoever has it
+# can act as the account that authorized it, within `photos wall`, and renew
+# indefinitely. Never commit it. Revoke at https://vk.ru/settings?act=apps
+db/vkid.json
+vkid.json
+
 # Editor / OS
 .DS_Store
 .idea/

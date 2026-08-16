@@ -10,6 +10,7 @@ import {
   stopModules,
 } from "@/core/module-loader";
 import { closeMtproto, getMtprotoClient, isMtprotoConfigured } from "@/lib/mtproto";
+import { vkUserStatus } from "@/lib/vkuser";
 import { appFiglet } from "@/utils/appFiglet";
 import logger from "@/lib/logger";
 
@@ -87,6 +88,10 @@ async function main(): Promise<void> {
   if (isMtprotoConfigured()) {
     await step("mtproto connect", () => getMtprotoClient());
   }
+
+  // Report the VK ID grant at boot for the same reason: a revoked authorization
+  // otherwise only surfaces as posts quietly losing their pictures.
+  logger.info(`[vkid] ${vkUserStatus()}`);
 
   // Register the Mini App as the default menu button so moderators can open it
   // directly from the bot's private chat (gives full Telegram Web App context,
