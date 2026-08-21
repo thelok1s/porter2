@@ -25,7 +25,38 @@ import logger from "@/lib/logger";
  *     given" even for a publicly reachable card with a 1080x1080 og:image.
  *
  * So a user token is genuinely the only route, and this module makes holding
- * one safe and unattended.
+ * one safe and unattended. It is NOT, however, a route that works by default —
+ * see "The permission wall" below before spending time here.
+ *
+ * The permission wall
+ * -------------------
+ * VK states the requirement on the method pages themselves. Both
+ * `photos.getWallUploadServer` and `photos.getUploadServer` say a user token is
+ * the only caller and that the `photos` right is "выдаётся в исключительных
+ * случаях через запрос в поддержку по электронной почте devsupport@corp.vk.com"
+ * — granted in exceptional cases, by email request. `wall.post` says the same
+ * of the `wall` right.
+ *
+ * Measured against a real grant (`npm run vkidprobe`), on an app created in the
+ * VK ID cabinet without business verification:
+ *
+ *   • the consent screen offers only «Общая информация», and the grant comes
+ *     back as `vkid.personal_info` — VK narrows the request silently rather
+ *     than rejecting an over-broad scope;
+ *   • photos.getWallUploadServer → Code 15, "cannot be called with current
+ *     scopes";
+ *   • photos.getUploadServer (the community-album idea, floated as a way round
+ *     the wall route) → Code 1051, and its method page carries the identical
+ *     `photos` requirement. It is not an alternative;
+ *   • wall.get works, so the token is live and the community readable.
+ *
+ * Code 1051 ("method is unavailable with current profile type") is absent from
+ * VK's published error table, which stops at 603. Do not read much into it.
+ *
+ * The escalation path is therefore singular: confirm a VK Бизнес ID profile
+ * (requires an ИНН), then email devsupport@corp.vk.com asking for `photos` and
+ * `wall` with a justification. Until that lands, posts go out text-only and
+ * this module reports the shortfall instead of pretending to work.
  *
  * Everything here is best-effort: `getVkUserAccessToken()` resolves to `null`
  * when VK ID is not configured or the grant has been revoked, and callers are
@@ -36,8 +67,9 @@ import logger from "@/lib/logger";
  *     signing account within its scopes. It is stored 0600 under ./db (a
  *     persisted, gitignored volume) and is never logged, not even truncated.
  *   • PKCE means there is no client_secret to protect.
- *   • Ask for `photos` and `wall` only. Both are ordinary scopes; the ones
- *     needing VK's individual approval are phone/email/messages.
+ *   • Ask for `photos` and `wall` only — nothing wider. Both are gated behind
+ *     an individual support request (see "The permission wall"), so a grant
+ *     that comes back narrower is the normal case, not a malfunction.
  */
 
 /** VK ID OAuth 2.1 endpoints. */
