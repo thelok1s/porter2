@@ -111,8 +111,14 @@ async function main() {
   // authorization: the code is only accepted for the request WE began.
   if (returned !== state) {
     console.error(
-      "state mismatch — this URL is not from the authorization just started.\n" +
-        "Re-run the script and use the fresh link.",
+      "state mismatch — this URL is not from the authorization just started.\n\n" +
+        "Most often this means the link came from an EARLIER run of this\n" +
+        "script — an older terminal line or a still-open tab. Each run mints a\n" +
+        "new state and code_verifier, and only the newest one can be redeemed.\n\n" +
+        `  expected state: ${state}\n` +
+        `  URL carried:    ${returned ?? "(none)"}\n\n` +
+        "Close old tabs, re-run, and open only the URL printed above. The code\n" +
+        "also expires 10 minutes after it is issued.",
     );
     process.exit(1);
   }
