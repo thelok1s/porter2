@@ -32,12 +32,15 @@ const errText = (e: unknown): string => {
 };
 
 /**
- * The egress IP VK sees. Best-effort and never fatal.
+ * The egress IP on the DEFAULT route — NOT necessarily the one VK sees.
  *
- * The whole point of running this both on the host and inside the container is
- * to compare these two numbers: a Mini App token is bound to the IP that minted
- * it, and the host and a container can leave by different paths (a proxy or VPN
- * configured for one and not the other). If they differ, that is the bug.
+ * This hits api.ipify.org, which is not a VK domain, so under split routing
+ * (vk.com direct, everything else through a VPN) it reports the VPN exit while
+ * VK traffic leaves by a different path entirely. That is a correct split, not
+ * a fault, and reading this number as "the IP VK sees" inverts the diagnosis.
+ *
+ * The authoritative signal is whether the VK checks below pass. Use this only
+ * to compare host vs container when NOTHING is working.
  */
 async function egressIp(): Promise<string> {
   try {
@@ -62,11 +65,10 @@ async function main(): Promise<void> {
   const api = new API({ token });
 
   console.log(`token:  ${tokenAge(token)}`);
-  console.log(`egress: ${await egressIp()}`);
+  console.log(`egress: ${await egressIp()}  (default route, NOT necessarily VK's)`);
   console.log(
-    "        ↑ run this on the HOST and inside the CONTAINER " +
-      "(docker compose exec porter npm run vkuserprobe).\n" +
-      "        Different IPs there is the whole explanation for Code 5.\n",
+    "        Under split routing this shows the VPN exit while vk.com goes\n" +
+      "        direct — that is correct, not a fault. The checks below decide.\n",
   );
 
   console.log("[1] users.get (is the token still alive?)");
