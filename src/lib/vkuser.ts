@@ -53,10 +53,33 @@ import logger from "@/lib/logger";
  * Code 1051 ("method is unavailable with current profile type") is absent from
  * VK's published error table, which stops at 603. Do not read much into it.
  *
- * The escalation path is therefore singular: confirm a VK Бизнес ID profile
- * (requires an ИНН), then email devsupport@corp.vk.com asking for `photos` and
- * `wall` with a justification. Until that lands, posts go out text-only and
- * this module reports the shortfall instead of pretending to work.
+ * The escalation path through VK ID is singular and, in practice, shut: it
+ * wants a VK Бизнес ID profile (an ИНН) and an approved support request, and
+ * those requests get refused.
+ *
+ * The Mini App route (what actually works)
+ * ---------------------------------------
+ * VK Mini Apps are a different surface with a different permission model, and
+ * they never moved to the VK ID cabinet — they are still created at
+ * vk.ru/editapp?act=create. `VKWebAppGetAuthToken` lists both `photos` and
+ * `wall` as requestable, and unlike `messages` (which VK marks as not granted
+ * since 2019) they carry no restriction note.
+ *
+ * Measured end to end on app 54703482:
+ *   • requested "photos,wall" → granted "photos,wall", no narrowing;
+ *   • photos.getWallUploadServer returned an upload_url for the community —
+ *     the exact call that answers Code 15 on a VK ID token and Code 27 on a
+ *     community token;
+ *   • the same token then worked from the SERVER, which was the open question.
+ *
+ * Two things to know about that token:
+ *   • It is IP-bound. One browser attempt failed with Code 5, "access_token was
+ *     given to another ip address". It works from the porter host today; if the
+ *     egress IP changes, expect Code 5 and paste a fresh token.
+ *   • The bridge returned no `expires` field at all, which means the lifetime
+ *     is UNKNOWN, not unlimited. There is no refresh token — when VK stops
+ *     accepting it, an admin re-opens the Mini App and pastes a new one into
+ *     VK_USER_TOKEN.
  *
  * Everything here is best-effort: `getVkUserAccessToken()` resolves to `null`
  * when VK ID is not configured or the grant has been revoked, and callers are
@@ -130,6 +153,7 @@ interface VkIdStore {
 
 /** True when an operator has configured the app and completed the login. */
 export function isVkUserConfigured(): boolean {
+  if (staticUserToken()) return true;
   return appId() !== "" && fs.existsSync(tokenFile());
 }
 
@@ -308,7 +332,19 @@ async function refreshAccessToken(store: VkIdStore): Promise<string | null> {
  * be revoked from the account's app settings at any time, and callers are
  * expected to carry on without the picture.
  */
+/**
+ * A user token pasted in from the VK Mini App bridge.
+ *
+ * This is the route that actually works. See "The Mini App route" in the header.
+ * It carries no refresh token, so it is used verbatim until VK stops accepting
+ * it, at which point an admin re-opens the Mini App and pastes a new one.
+ */
+const staticUserToken = (): string => (process.env.VK_USER_TOKEN ?? "").trim();
+
 export async function getVkUserAccessToken(): Promise<string | null> {
+  const pasted = staticUserToken();
+  if (pasted) return pasted;
+
   if (!appId()) return null;
 
   const store = readStore();
@@ -342,7 +378,7 @@ export async function uploadWallPhoto(
   source: Buffer | string,
   groupId: number,
 ): Promise<string | null> {
-  const store = readStore();
+  const store = staticUserToken() ? null : readStore();
   if (store) {
     const missing = missingScopes(store.scope);
     if (missing.length > 0) {
@@ -373,13 +409,26 @@ export async function uploadWallPhoto(
     };
     return `photo${ownerId}_${id}${accessKey ? `_${accessKey}` : ""}`;
   } catch (error) {
-    logger.error(`[vkid] wall photo upload failed: ${String(error)}`);
+    const code = (error as { code?: number })?.code;
+    if (code === 5) {
+      // The Mini App token is bound to the IP that obtained it. Seen once from
+      // a browser, then fine from the server — but if the host's egress IP
+      // changes, this is the symptom, and it reads nothing like an IP problem.
+      logger.error(
+        "[vkid] wall photo upload failed with Code 5 (token issued to another " +
+          "IP). Re-open the Mini App from this network and paste a fresh " +
+          "VK_USER_TOKEN. Posting text-only meanwhile.",
+      );
+    } else {
+      logger.error(`[vkid] wall photo upload failed: ${String(error)}`);
+    }
     return null;
   }
 }
 
 /** One-line status for the boot log; deliberately says nothing about values. */
 export function vkUserStatus(): string {
+  if (staticUserToken()) return "using VK_USER_TOKEN (Mini App grant)";
   if (!appId()) return "not configured (VKID_APP_ID unset)";
   const store = readStore();
   if (!store?.refreshToken) return `no grant stored — run \`npm run vkidlogin\``;
