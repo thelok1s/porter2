@@ -119,7 +119,7 @@ async function main() {
   }
 
   try {
-    const store = await exchangeCode(code, verifier, deviceId);
+    const store = await exchangeCode(code, verifier, deviceId, state);
     writeStore(store);
 
     console.log(`\n✓ Authorized as user ${store.userId}.`);

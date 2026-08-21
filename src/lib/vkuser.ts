@@ -198,6 +198,7 @@ export async function exchangeCode(
   code: string,
   codeVerifier: string,
   deviceId: string,
+  state: string,
 ): Promise<VkIdStore> {
   const token = await postToken({
     grant_type: "authorization_code",
@@ -206,6 +207,9 @@ export async function exchangeCode(
     client_id: APP_ID,
     device_id: deviceId,
     redirect_uri: REDIRECT_URI,
+    // VK ID lists state as required here, not just on /authorize, and it must
+    // be the value the authorization started with.
+    state,
   });
   return storeFromResponse(token, deviceId);
 }
