@@ -91,7 +91,7 @@ async function main(): Promise<void> {
 
   // Report the VK ID grant at boot for the same reason: a revoked authorization
   // otherwise only surfaces as posts quietly losing their pictures.
-  logger.info(`[vkid] ${vkUserStatus()}`);
+  logger.info(`[vk] ${vkUserStatus()}`);
 
   // Register the Mini App as the default menu button so moderators can open it
   // directly from the bot's private chat (gives full Telegram Web App context,

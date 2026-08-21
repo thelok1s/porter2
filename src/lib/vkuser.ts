@@ -1,19 +1,15 @@
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
 import { VK } from "vk-io";
+
 import logger from "@/lib/logger";
 
 /**
- * A VK *user* authorization living alongside the community token.
+ * The VK *user* token that lets porter put a PHOTO on a wall post.
  *
- * Porter talks to VK with a community token for everything it can, but one
- * capability is closed to community auth by design: putting a PHOTO on a wall
- * post. `photos.getWallUploadServer` and `photos.saveWallPhoto` answer Code 27
- * ("method is unavailable with group auth") no matter which rights the token
- * carries, and VK's own access-rights reference lists community scopes as only
- * stories/photos/app_widget/messages/docs/manage. Every community-token route
- * was tried and measured against the live wall:
+ * Porter uses a community token for everything else, but attaching a photo is
+ * closed to community auth by design: `photos.getWallUploadServer` and
+ * `photos.saveWallPhoto` answer Code 27 ("method is unavailable with group
+ * auth") no matter which rights the token carries. Every community-token route
+ * was measured against the live wall and rejected:
  *
  *   • messages upload server — uploads fine and `wall.post` ACCEPTS the
  *     attachment, but VK strips it on publish; those photos live in album -3,
@@ -23,376 +19,70 @@ import logger from "@/lib/logger";
  *     unrecognised blob and renders as a "file0.dat" download link.
  *   • an Open Graph link snippet — VK answers "link_photo_sizing_rule. No photo
  *     given" even for a publicly reachable card with a 1080x1080 og:image.
+ *   • photos.getUploadServer (a normal community album) — same `photos`
+ *     requirement as the wall route. Not an alternative.
  *
- * So a user token is genuinely the only route, and this module makes holding
- * one safe and unattended. It is NOT, however, a route that works by default —
- * see "The permission wall" below before spending time here.
+ * A VK ID app cannot supply the token either: `photos` and `wall` are extended
+ * rights there, gated behind a VK Бизнес ID profile (an ИНН) and a support
+ * request that gets refused. Asking for them yields `vkid.personal_info` and
+ * Code 15 on the upload call. That whole route was built, measured, and removed.
  *
- * The permission wall
- * -------------------
- * VK states the requirement on the method pages themselves. Both
- * `photos.getWallUploadServer` and `photos.getUploadServer` say a user token is
- * the only caller and that the `photos` right is "выдаётся в исключительных
- * случаях через запрос в поддержку по электронной почте devsupport@corp.vk.com"
- * — granted in exceptional cases, by email request. `wall.post` says the same
- * of the `wall` right.
+ * What works is a VK MINI APP token. Mini Apps kept the old permission model
+ * and are still created at vk.ru/editapp?act=create, outside the VK ID business
+ * cabinet. `VKWebAppGetAuthToken` with `scope: "photos,wall"` grants both with
+ * no narrowing, and the resulting token reaches the wall upload route from the
+ * server. See VK_USER_TOKEN in .env.example for how to mint one.
  *
- * Measured against a real grant (`npm run vkidprobe`), on an app created in the
- * VK ID cabinet without business verification:
- *
- *   • the consent screen offers only «Общая информация», and the grant comes
- *     back as `vkid.personal_info` — VK narrows the request silently rather
- *     than rejecting an over-broad scope;
- *   • photos.getWallUploadServer → Code 15, "cannot be called with current
- *     scopes";
- *   • photos.getUploadServer (the community-album idea, floated as a way round
- *     the wall route) → Code 1051, and its method page carries the identical
- *     `photos` requirement. It is not an alternative;
- *   • wall.get works, so the token is live and the community readable.
- *
- * Code 1051 ("method is unavailable with current profile type") is absent from
- * VK's published error table, which stops at 603. Do not read much into it.
- *
- * The escalation path through VK ID is singular and, in practice, shut: it
- * wants a VK Бизнес ID profile (an ИНН) and an approved support request, and
- * those requests get refused.
- *
- * The Mini App route (what actually works)
- * ---------------------------------------
- * VK Mini Apps are a different surface with a different permission model, and
- * they never moved to the VK ID cabinet — they are still created at
- * vk.ru/editapp?act=create. `VKWebAppGetAuthToken` lists both `photos` and
- * `wall` as requestable, and unlike `messages` (which VK marks as not granted
- * since 2019) they carry no restriction note.
- *
- * Measured end to end on app 54703482:
- *   • requested "photos,wall" → granted "photos,wall", no narrowing;
- *   • photos.getWallUploadServer returned an upload_url for the community —
- *     the exact call that answers Code 15 on a VK ID token and Code 27 on a
- *     community token;
- *   • the same token then worked from the SERVER, which was the open question.
- *
- * Two things to know about that token:
- *   • It is IP-bound. One browser attempt failed with Code 5, "access_token was
- *     given to another ip address". It works from the porter host today; if the
- *     egress IP changes, expect Code 5 and paste a fresh token.
- *   • The bridge returned no `expires` field at all, which means the lifetime
- *     is UNKNOWN, not unlimited. There is no refresh token — when VK stops
- *     accepting it, an admin re-opens the Mini App and pastes a new one into
- *     VK_USER_TOKEN.
+ * Two limits, both hit in practice:
+ *   • The token is IP-BOUND — Code 5, "access_token was given to another ip
+ *     address". It works from the porter host; a changed egress IP needs a
+ *     fresh token taken from that network.
+ *   • VK returns no expiry for it and there is no refresh token, so the
+ *     lifetime is UNKNOWN rather than unlimited. When it stops working, an
+ *     admin re-opens the Mini App and pastes a new one.
  *
  * Everything here is best-effort: `getVkUserAccessToken()` resolves to `null`
- * when VK ID is not configured or the grant has been revoked, and callers are
- * expected to fall back (post without the picture) rather than error out.
+ * when no token is configured, and callers are expected to fall back (post
+ * without the picture) rather than error out. A missing photo must never cost
+ * a scheduled post.
  *
- * Security notes:
- *   • The refresh token is password-grade — anyone holding it can act as the
- *     signing account within its scopes. It is stored 0600 under ./db (a
- *     persisted, gitignored volume) and is never logged, not even truncated.
- *   • PKCE means there is no client_secret to protect.
- *   • Ask for `photos` and `wall` only — nothing wider. Both are gated behind
- *     an individual support request (see "The permission wall"), so a grant
- *     that comes back narrower is the normal case, not a malfunction.
+ * The token is password-grade — it acts as the admin who approved it — so it is
+ * never logged, not even truncated.
  */
-
-/** VK ID OAuth 2.1 endpoints. */
-export const VKID_AUTHORIZE_URL = "https://id.vk.ru/authorize";
-export const VKID_TOKEN_URL = "https://id.vk.ru/oauth2/auth";
-
-/** Everything porter needs and nothing else. */
-export const VKID_SCOPE = "photos wall";
-
-/**
- * What an upload actually needs. VK ID narrows the grant to whatever the app
- * is allowed in its Доступы settings and reports the result in `scope` — it
- * does NOT reject an over-broad request. Ask for `photos wall` on an app that
- * may not have them and you get back `vkid.personal_info` with no error, so
- * the shortfall has to be detected here or it stays invisible until a post
- * silently goes out without its picture.
- */
-export function missingScopes(scope: string): string[] {
-  const granted = new Set(scope.split(/\s+/).filter(Boolean));
-  return ["photos", "wall"].filter((s) => !granted.has(s));
-}
 
 /**
  * Read on every use, never at import time.
  *
- * An entrypoint calls `dotenv.config()` in its module body, but ESM evaluates
- * every import first — so a module-level `process.env.VKID_APP_ID` here is
- * captured before the .env file is loaded and stays empty for the life of the
- * process. Under compose the variables arrive as real process env and it works
- * by accident, which is exactly how this hid: it only broke for the one
- * entrypoint that depends on dotenv, `npm run vkidlogin`, where it silently
- * built an authorize URL with `client_id=` blank.
- */
-const appId = (): string => (process.env.VKID_APP_ID ?? "").trim();
-const redirectUri = (): string => (process.env.VKID_REDIRECT_URI ?? "").trim();
-const tokenFile = (): string =>
-  path.resolve(process.env.VKID_TOKEN_FILE ?? "./db/vkid.json");
-
-/**
- * Renew this long before expiry. VK ID access tokens live about an hour; a
- * generous skew means a slow upload never starts with a token that dies
- * mid-request.
- */
-const EXPIRY_SKEW_MS = 5 * 60 * 1000;
-
-interface VkIdStore {
-  /** Password-grade. Rotates on every refresh — always persist the new one. */
-  refreshToken: string;
-  /** VK ID binds the grant to this; refresh fails without the original. */
-  deviceId: string;
-  userId: number;
-  scope: string;
-  accessToken?: string;
-  /** Epoch ms. */
-  accessExpiresAt?: number;
-  updatedAt: string;
-}
-
-/** True when an operator has configured the app and completed the login. */
-export function isVkUserConfigured(): boolean {
-  if (staticUserToken()) return true;
-  return appId() !== "" && fs.existsSync(tokenFile());
-}
-
-export function vkUserTokenFile(): string {
-  return tokenFile();
-}
-
-function readStore(): VkIdStore | null {
-  try {
-    return JSON.parse(fs.readFileSync(tokenFile(), "utf8")) as VkIdStore;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      logger.error(`[vkid] cannot read ${tokenFile()}: ${String(error)}`);
-    }
-    return null;
-  }
-}
-
-/**
- * Persist atomically and 0600.
- *
- * Written to a temp file and renamed so a crash mid-write cannot leave a
- * truncated store — losing the refresh token means a human has to redo the
- * browser login, so this is worth the care. The mode is set on the temp file
- * BEFORE the rename, so the token is never briefly world-readable.
- */
-export function writeStore(store: VkIdStore): void {
-  const file = tokenFile();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
-  fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
-}
-
-/** A state value satisfying VK ID's "at least 32 chars of [a-zA-Z0-9_-]". */
-export function randomState(): string {
-  return crypto.randomBytes(32).toString("base64url");
-}
-
-/** PKCE verifier plus its S256 challenge. */
-export function createPkce(): { verifier: string; challenge: string } {
-  const verifier = crypto.randomBytes(48).toString("base64url");
-  const challenge = crypto
-    .createHash("sha256")
-    .update(verifier)
-    .digest("base64url");
-  return { verifier, challenge };
-}
-
-/** The URL an administrator opens once, in a browser, to grant access. */
-export function buildAuthorizeUrl(challenge: string, state: string): string {
-  const params = new URLSearchParams({
-    response_type: "code",
-    client_id: appId(),
-    redirect_uri: redirectUri(),
-    scope: VKID_SCOPE,
-    state,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  });
-  return `${VKID_AUTHORIZE_URL}?${params.toString()}`;
-}
-
-interface TokenResponse {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  user_id?: number;
-  scope?: string;
-  error?: string;
-  error_description?: string;
-}
-
-/**
- * Post to VK ID's token endpoint.
- *
- * Errors carry only VK's `error`/`error_description` — never the request body,
- * which holds the refresh token or the authorization code.
- */
-async function postToken(
-  body: Record<string, string>,
-): Promise<TokenResponse> {
-  const res = await fetch(VKID_TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(body).toString(),
-  });
-
-  const json = (await res.json().catch(() => ({}))) as TokenResponse;
-  if (!res.ok || json.error || !json.access_token) {
-    throw new Error(
-      `VK ID ${res.status}: ${json.error ?? "unknown"}` +
-        (json.error_description ? ` — ${json.error_description}` : ""),
-    );
-  }
-  return json;
-}
-
-function storeFromResponse(
-  token: TokenResponse,
-  deviceId: string,
-  previous?: VkIdStore,
-): VkIdStore {
-  return {
-    // VK ID rotates the refresh token on every use; keeping the old one would
-    // work exactly once and then lock us out.
-    refreshToken: token.refresh_token ?? previous?.refreshToken ?? "",
-    deviceId,
-    userId: token.user_id ?? previous?.userId ?? 0,
-    scope: token.scope ?? previous?.scope ?? VKID_SCOPE,
-    accessToken: token.access_token,
-    accessExpiresAt: Date.now() + (token.expires_in ?? 3600) * 1000,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-/** Exchange the one-time authorization code. Used by the login script. */
-export async function exchangeCode(
-  code: string,
-  codeVerifier: string,
-  deviceId: string,
-  state: string,
-): Promise<VkIdStore> {
-  const token = await postToken({
-    grant_type: "authorization_code",
-    code,
-    code_verifier: codeVerifier,
-    client_id: appId(),
-    device_id: deviceId,
-    redirect_uri: redirectUri(),
-    // VK ID lists state as required here, not just on /authorize, and it must
-    // be the value the authorization started with.
-    state,
-  });
-  return storeFromResponse(token, deviceId);
-}
-
-/**
- * Serialises refreshes.
- *
- * The refresh token rotates on use, so two concurrent refreshes race: the
- * second presents a token the first already spent, VK rejects it, and the
- * stored grant is dead until someone repeats the browser login. Publishing an
- * announcement while a submission is being approved is enough to trigger that,
- * so every caller waits on the same promise.
- */
-let inflight: Promise<string | null> | null = null;
-
-async function refreshAccessToken(store: VkIdStore): Promise<string | null> {
-  try {
-    const token = await postToken({
-      grant_type: "refresh_token",
-      refresh_token: store.refreshToken,
-      client_id: appId(),
-      device_id: store.deviceId,
-      state: randomState(),
-    });
-    const next = storeFromResponse(token, store.deviceId, store);
-    writeStore(next);
-    logger.info("[vkid] access token refreshed");
-    return next.accessToken ?? null;
-  } catch (error) {
-    logger.error(
-      `[vkid] refresh failed: ${String(error)} — photo uploads are disabled ` +
-        "until `npm run vkidlogin` is run again",
-    );
-    return null;
-  }
-}
-
-/**
- * A valid user access token, or null when unavailable.
- *
- * Null is a normal outcome, not an exception: VK ID is optional, the grant can
- * be revoked from the account's app settings at any time, and callers are
- * expected to carry on without the picture.
- */
-/**
- * A user token pasted in from the VK Mini App bridge.
- *
- * This is the route that actually works. See "The Mini App route" in the header.
- * It carries no refresh token, so it is used verbatim until VK stops accepting
- * it, at which point an admin re-opens the Mini App and pastes a new one.
+ * `main.ts` calls `dotenv.config()` in its module body, but ESM evaluates every
+ * import first — a module-level `process.env.VK_USER_TOKEN` here would be
+ * captured before .env is loaded and stay empty for the life of the process.
+ * Under compose the variables arrive as real process env and it works by
+ * accident, which is exactly how that class of bug hides.
  */
 const staticUserToken = (): string => (process.env.VK_USER_TOKEN ?? "").trim();
 
+/** Whether a user token is available at all. */
+export function isVkUserConfigured(): boolean {
+  return staticUserToken() !== "";
+}
+
+/** The user token, or null when none is configured. */
 export async function getVkUserAccessToken(): Promise<string | null> {
-  const pasted = staticUserToken();
-  if (pasted) return pasted;
-
-  if (!appId()) return null;
-
-  const store = readStore();
-  if (!store?.refreshToken) return null;
-
-  if (
-    store.accessToken &&
-    store.accessExpiresAt &&
-    store.accessExpiresAt - EXPIRY_SKEW_MS > Date.now()
-  ) {
-    return store.accessToken;
-  }
-
-  if (!inflight) {
-    inflight = refreshAccessToken(store).finally(() => {
-      inflight = null;
-    });
-  }
-  return inflight;
+  return staticUserToken() || null;
 }
 
 /**
  * Upload artwork as a real wall photo and return its attachment string.
  *
- * Returns null whenever the photo cannot be attached — no VK ID grant, a
- * revoked token, a rejected upload — so callers post text-only rather than
- * losing the post. `groupId` is the POSITIVE community id, which is the
- * spelling VK's photo methods use.
+ * Returns null whenever the photo cannot be attached — no token, a dead token,
+ * a rejected upload — so callers post text-only rather than losing the post.
+ * `groupId` is the POSITIVE community id, which is the spelling VK's photo
+ * methods use.
  */
 export async function uploadWallPhoto(
   source: Buffer | string,
   groupId: number,
 ): Promise<string | null> {
-  const store = staticUserToken() ? null : readStore();
-  if (store) {
-    const missing = missingScopes(store.scope);
-    if (missing.length > 0) {
-      // Doomed before it starts — VK would answer Code 27/15. Say why once,
-      // rather than letting a generic upload failure hide a settings problem.
-      logger.warn(
-        `[vkid] skipping photo upload: grant lacks ${missing.join(" and ")} ` +
-          `(granted "${store.scope}"). These are extended rights — enable them ` +
-          "in the app's Доступы, then re-run `npm run vkidlogin`.",
-      );
-      return null;
-    }
-  }
-
   const token = await getVkUserAccessToken();
   if (!token) return null;
 
@@ -411,16 +101,15 @@ export async function uploadWallPhoto(
   } catch (error) {
     const code = (error as { code?: number })?.code;
     if (code === 5) {
-      // The Mini App token is bound to the IP that obtained it. Seen once from
-      // a browser, then fine from the server — but if the host's egress IP
-      // changes, this is the symptom, and it reads nothing like an IP problem.
+      // Bound to the IP that obtained it. Named explicitly because an
+      // IP-binding failure reads nothing like one in a generic upload error.
       logger.error(
-        "[vkid] wall photo upload failed with Code 5 (token issued to another " +
-          "IP). Re-open the Mini App from this network and paste a fresh " +
-          "VK_USER_TOKEN. Posting text-only meanwhile.",
+        "[vk] wall photo upload failed with Code 5 (token issued to another " +
+          "IP, or expired). Re-open the Mini App from this network and paste " +
+          "a fresh VK_USER_TOKEN. Posting text-only meanwhile.",
       );
     } else {
-      logger.error(`[vkid] wall photo upload failed: ${String(error)}`);
+      logger.error(`[vk] wall photo upload failed: ${String(error)}`);
     }
     return null;
   }
@@ -428,16 +117,7 @@ export async function uploadWallPhoto(
 
 /** One-line status for the boot log; deliberately says nothing about values. */
 export function vkUserStatus(): string {
-  if (staticUserToken()) return "using VK_USER_TOKEN (Mini App grant)";
-  if (!appId()) return "not configured (VKID_APP_ID unset)";
-  const store = readStore();
-  if (!store?.refreshToken) return `no grant stored — run \`npm run vkidlogin\``;
-  const missing = missingScopes(store.scope);
-  if (missing.length > 0) {
-    return (
-      `grant for user ${store.userId} is MISSING ${missing.join(" and ")} ` +
-      `(granted: "${store.scope}") — photo uploads stay disabled`
-    );
-  }
-  return `authorized as user ${store.userId}, scope "${store.scope}"`;
+  return isVkUserConfigured()
+    ? "VK_USER_TOKEN set — wall photos enabled"
+    : "no VK_USER_TOKEN — posts will go out text-only";
 }

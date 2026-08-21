@@ -15,10 +15,9 @@
     "lint": "eslint .",
     "init": "tsx src/scripts/initdb.ts",
     "mtlogin": "tsx src/scripts/mtlogin.ts",
-    "vkidlogin": "tsx src/scripts/vkidlogin.ts",
     "prune": "tsx src/scripts/prunedb.ts",
     "vkprobe": "tsx src/scripts/vkphotoprobe.ts",
-    "vkidprobe": "tsx src/scripts/vkidprobe.ts",
+    "vkuserprobe": "tsx src/scripts/vkuserprobe.ts",
     "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59"
   },
   "dependencies": {
