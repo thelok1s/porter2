@@ -18,6 +18,7 @@
     "vkidlogin": "tsx src/scripts/vkidlogin.ts",
     "prune": "tsx src/scripts/prunedb.ts",
     "vkprobe": "tsx src/scripts/vkphotoprobe.ts",
+    "vkidprobe": "tsx src/scripts/vkidprobe.ts",
     "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59"
   },
   "dependencies": {
