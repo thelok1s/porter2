@@ -46,3 +46,6 @@ vkid.json
 .idea/
 .vscode/
 docs/specs/
+
+# Token fingerprint + first-use timestamp. No secret, but no reason to ship it.
+db/vktoken.json

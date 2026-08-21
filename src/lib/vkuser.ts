@@ -1,3 +1,6 @@
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
 import { VK } from "vk-io";
 
 import logger from "@/lib/logger";
@@ -61,6 +64,56 @@ import logger from "@/lib/logger";
  */
 const staticUserToken = (): string => (process.env.VK_USER_TOKEN ?? "").trim();
 
+/**
+ * First-use bookkeeping, so "how long do these tokens live?" stops being a
+ * guess.
+ *
+ * VK returns no expiry for a Mini App token, so the only way to learn the
+ * lifetime is to measure it: record when a given token was first seen and
+ * report its age when it dies. Stores a SHA-256 prefix, never the token — the
+ * fingerprint is enough to notice rotation and useless to anyone who reads it.
+ */
+const metaFile = (): string =>
+  path.resolve(process.env.VK_USER_TOKEN_META ?? "./db/vktoken.json");
+
+function fingerprint(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+interface TokenMeta {
+  fingerprint: string;
+  firstSeen: string;
+}
+
+function readMeta(): TokenMeta | null {
+  try {
+    return JSON.parse(fs.readFileSync(metaFile(), "utf8")) as TokenMeta;
+  } catch {
+    return null;
+  }
+}
+
+/** Age of the current token, recording first sight if this one is new. */
+export function tokenAge(token: string): string {
+  const fp = fingerprint(token);
+  let meta = readMeta();
+  if (meta?.fingerprint !== fp) {
+    meta = { fingerprint: fp, firstSeen: new Date().toISOString() };
+    try {
+      fs.mkdirSync(path.dirname(metaFile()), { recursive: true });
+      fs.writeFileSync(metaFile(), JSON.stringify(meta, null, 2), {
+        mode: 0o600,
+      });
+    } catch {
+      return "age unknown (could not record first use)";
+    }
+  }
+  const hours = (Date.now() - Date.parse(meta.firstSeen)) / 3_600_000;
+  return hours < 48
+    ? `first seen ${hours.toFixed(1)} h ago`
+    : `first seen ${(hours / 24).toFixed(1)} days ago`;
+}
+
 /** Whether a user token is available at all. */
 export function isVkUserConfigured(): boolean {
   return staticUserToken() !== "";
@@ -99,17 +152,33 @@ export async function uploadWallPhoto(
     };
     return `photo${ownerId}_${id}${accessKey ? `_${accessKey}` : ""}`;
   } catch (error) {
-    const code = (error as { code?: number })?.code;
-    if (code === 5) {
-      // Bound to the IP that obtained it. Named explicitly because an
-      // IP-binding failure reads nothing like one in a generic upload error.
+    const err = error as { code?: number; message?: string };
+    if (err?.code === 5) {
+      // Code 5 has several distinct causes with OPPOSITE fixes, and VK spells
+      // out which in the message. Log it verbatim — guessing here sent a
+      // previous investigation after the wrong one.
+      //
+      //   "...was given to another ip address" → egress IP moved; mint a token
+      //       from the network porter actually calls VK from.
+      //   "invalid access_token (4)"           → expired or revoked; mint a new
+      //       one, and note how long the old one lasted.
+      const said = err.message ?? "(no message)";
+      const cause = /another ip address/i.test(said)
+        ? "IP MISMATCH — the token was issued from a different egress IP"
+        : /invalid access_token/i.test(said)
+          ? "TOKEN DEAD — expired or revoked, not an IP problem"
+          : "unrecognised Code 5 variant";
       logger.error(
-        "[vk] wall photo upload failed with Code 5 (token issued to another " +
-          "IP, or expired). Re-open the Mini App from this network and paste " +
-          "a fresh VK_USER_TOKEN. Posting text-only meanwhile.",
+        `[vk] wall photo upload failed — ${cause}. VK said: "${said}". ` +
+          `Token ${tokenAge(token)}. Diagnose with \`npm run vkuserprobe\` ` +
+          "(run it INSIDE the container: docker compose exec porter " +
+          "npm run vkuserprobe). Posting text-only.",
       );
     } else {
-      logger.error(`[vk] wall photo upload failed: ${String(error)}`);
+      logger.error(
+        `[vk] wall photo upload failed: Code ${err?.code ?? "?"} — ` +
+          `${err?.message ?? String(error)}`,
+      );
     }
     return null;
   }
@@ -117,7 +186,8 @@ export async function uploadWallPhoto(
 
 /** One-line status for the boot log; deliberately says nothing about values. */
 export function vkUserStatus(): string {
-  return isVkUserConfigured()
-    ? "VK_USER_TOKEN set — wall photos enabled"
+  const token = staticUserToken();
+  return token
+    ? `VK_USER_TOKEN set — wall photos enabled (${tokenAge(token)})`
     : "no VK_USER_TOKEN — posts will go out text-only";
 }

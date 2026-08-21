@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { API } from "vk-io";
 
-import { getVkUserAccessToken } from "@/lib/vkuser";
+import { getVkUserAccessToken, tokenAge } from "@/lib/vkuser";
 
 /**
  * Read-only probe of the VK user token in VK_USER_TOKEN.
@@ -31,6 +31,26 @@ const errText = (e: unknown): string => {
     : String(e);
 };
 
+/**
+ * The egress IP VK sees. Best-effort and never fatal.
+ *
+ * The whole point of running this both on the host and inside the container is
+ * to compare these two numbers: a Mini App token is bound to the IP that minted
+ * it, and the host and a container can leave by different paths (a proxy or VPN
+ * configured for one and not the other). If they differ, that is the bug.
+ */
+async function egressIp(): Promise<string> {
+  try {
+    const res = await fetch("https://api.ipify.org?format=json", {
+      signal: AbortSignal.timeout(5000),
+    });
+    const j = (await res.json()) as { ip?: string };
+    return j.ip ?? "(no answer)";
+  } catch {
+    return "(lookup failed — no outbound HTTPS?)";
+  }
+}
+
 async function main(): Promise<void> {
   console.log(`VK user token probe — group ${GROUP_ID} (owner ${OWNER_ID})\n`);
 
@@ -41,15 +61,33 @@ async function main(): Promise<void> {
   }
   const api = new API({ token });
 
+  console.log(`token:  ${tokenAge(token)}`);
+  console.log(`egress: ${await egressIp()}`);
+  console.log(
+    "        ↑ run this on the HOST and inside the CONTAINER " +
+      "(docker compose exec porter npm run vkuserprobe).\n" +
+      "        Different IPs there is the whole explanation for Code 5.\n",
+  );
+
   console.log("[1] users.get (is the token still alive?)");
   try {
     const users = await api.users.get({});
     const u = users[0];
     console.log(`    ok — user ${u?.id} ${u?.first_name} ${u?.last_name}\n`);
   } catch (e) {
+    const msg = (e as { message?: string })?.message ?? "";
     console.log(`    FAILED — ${errText(e)}`);
-    console.log("    Code 5 here means the token expired or was issued to a");
-    console.log("    different IP. Mint a fresh one from this network.\n");
+    if (/another ip address/i.test(msg)) {
+      console.log("    → IP MISMATCH. The token was minted from a different");
+      console.log("      egress IP than the one printed above. Mint one from");
+      console.log("      THIS network (see the SSH tunnel note in the docs).\n");
+    } else if (/invalid access_token/i.test(msg)) {
+      console.log("    → TOKEN DEAD (expired or revoked), not an IP problem.");
+      console.log("      The age above is how long it lasted — worth noting,");
+      console.log("      it is the only way we learn the real lifetime.\n");
+    } else {
+      console.log("");
+    }
   }
 
   console.log("[2] photos.getWallUploadServer (the route photos depend on)");
