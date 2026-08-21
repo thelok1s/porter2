@@ -48,6 +48,19 @@ export const VKID_TOKEN_URL = "https://id.vk.ru/oauth2/auth";
 export const VKID_SCOPE = "photos wall";
 
 /**
+ * What an upload actually needs. VK ID narrows the grant to whatever the app
+ * is allowed in its Доступы settings and reports the result in `scope` — it
+ * does NOT reject an over-broad request. Ask for `photos wall` on an app that
+ * may not have them and you get back `vkid.personal_info` with no error, so
+ * the shortfall has to be detected here or it stays invisible until a post
+ * silently goes out without its picture.
+ */
+export function missingScopes(scope: string): string[] {
+  const granted = new Set(scope.split(/\s+/).filter(Boolean));
+  return ["photos", "wall"].filter((s) => !granted.has(s));
+}
+
+/**
  * Read on every use, never at import time.
  *
  * An entrypoint calls `dotenv.config()` in its module body, but ESM evaluates
@@ -297,6 +310,21 @@ export async function uploadWallPhoto(
   source: Buffer | string,
   groupId: number,
 ): Promise<string | null> {
+  const store = readStore();
+  if (store) {
+    const missing = missingScopes(store.scope);
+    if (missing.length > 0) {
+      // Doomed before it starts — VK would answer Code 27/15. Say why once,
+      // rather than letting a generic upload failure hide a settings problem.
+      logger.warn(
+        `[vkid] skipping photo upload: grant lacks ${missing.join(" and ")} ` +
+          `(granted "${store.scope}"). These are extended rights — enable them ` +
+          "in the app's Доступы, then re-run `npm run vkidlogin`.",
+      );
+      return null;
+    }
+  }
+
   const token = await getVkUserAccessToken();
   if (!token) return null;
 
@@ -323,5 +351,12 @@ export function vkUserStatus(): string {
   if (!appId()) return "not configured (VKID_APP_ID unset)";
   const store = readStore();
   if (!store?.refreshToken) return `no grant stored — run \`npm run vkidlogin\``;
+  const missing = missingScopes(store.scope);
+  if (missing.length > 0) {
+    return (
+      `grant for user ${store.userId} is MISSING ${missing.join(" and ")} ` +
+      `(granted: "${store.scope}") — photo uploads stay disabled`
+    );
+  }
   return `authorized as user ${store.userId}, scope "${store.scope}"`;
 }

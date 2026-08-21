@@ -5,6 +5,7 @@ import {
   createPkce,
   exchangeCode,
   randomState,
+  missingScopes,
   vkUserTokenFile,
   writeStore,
   VKID_SCOPE,
@@ -127,9 +128,27 @@ async function main() {
     const store = await exchangeCode(code, verifier, deviceId, state);
     writeStore(store);
 
-    console.log(`\n✓ Authorized as user ${store.userId}.`);
+    const missing = missingScopes(store.scope);
+    console.log(
+      missing.length > 0
+        ? `\n! Authorized as user ${store.userId}, but WITHOUT the rights needed.`
+        : `\n✓ Authorized as user ${store.userId}.`,
+    );
     console.log(`  scope:  ${store.scope}`);
     console.log(`  stored: ${vkUserTokenFile()} (0600)`);
+
+    if (missing.length > 0) {
+      console.log(
+        `\n  Requested "${VKID_SCOPE}" but VK granted only "${store.scope}" —\n` +
+          `  ${missing.join(" and ")} ${missing.length > 1 ? "are" : "is"} missing, so photo uploads will NOT work.\n` +
+          "\n  VK ID narrows a grant to whatever the app allows in its Доступы\n" +
+          "  settings and reports the result instead of failing, which is why the\n" +
+          "  consent screen offered only «Общая информация».\n" +
+          "\n  photos and wall are EXTENDED rights: they need a confirmed VK Бизнес\n" +
+          "  ID profile plus an approved request to devsupport@corp.vk.com. Until\n" +
+          "  then posts go out text-only, which porter already handles.\n",
+      );
+    }
     console.log(
       "\nThe refresh token in that file is password-grade — anyone holding it\n" +
         "can act as this account within the scope above. It lives on the ./db\n" +
