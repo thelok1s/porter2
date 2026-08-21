@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+import "dotenv/config";
 import readline from "readline";
 import {
   buildAuthorizeUrl,
@@ -32,7 +32,6 @@ import {
  * Run: `npm run vkidlogin`
  */
 
-dotenv.config();
 
 const APP_ID = (process.env.VKID_APP_ID ?? "").trim();
 const REDIRECT_URI = (process.env.VKID_REDIRECT_URI ?? "").trim();

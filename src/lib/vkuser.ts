@@ -47,12 +47,21 @@ export const VKID_TOKEN_URL = "https://id.vk.ru/oauth2/auth";
 /** Everything porter needs and nothing else. */
 export const VKID_SCOPE = "photos wall";
 
-const APP_ID = (process.env.VKID_APP_ID ?? "").trim();
-const REDIRECT_URI = (process.env.VKID_REDIRECT_URI ?? "").trim();
-
-const TOKEN_FILE = path.resolve(
-  process.env.VKID_TOKEN_FILE ?? "./db/vkid.json",
-);
+/**
+ * Read on every use, never at import time.
+ *
+ * An entrypoint calls `dotenv.config()` in its module body, but ESM evaluates
+ * every import first — so a module-level `process.env.VKID_APP_ID` here is
+ * captured before the .env file is loaded and stays empty for the life of the
+ * process. Under compose the variables arrive as real process env and it works
+ * by accident, which is exactly how this hid: it only broke for the one
+ * entrypoint that depends on dotenv, `npm run vkidlogin`, where it silently
+ * built an authorize URL with `client_id=` blank.
+ */
+const appId = (): string => (process.env.VKID_APP_ID ?? "").trim();
+const redirectUri = (): string => (process.env.VKID_REDIRECT_URI ?? "").trim();
+const tokenFile = (): string =>
+  path.resolve(process.env.VKID_TOKEN_FILE ?? "./db/vkid.json");
 
 /**
  * Renew this long before expiry. VK ID access tokens live about an hour; a
@@ -76,19 +85,19 @@ interface VkIdStore {
 
 /** True when an operator has configured the app and completed the login. */
 export function isVkUserConfigured(): boolean {
-  return APP_ID !== "" && fs.existsSync(TOKEN_FILE);
+  return appId() !== "" && fs.existsSync(tokenFile());
 }
 
 export function vkUserTokenFile(): string {
-  return TOKEN_FILE;
+  return tokenFile();
 }
 
 function readStore(): VkIdStore | null {
   try {
-    return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8")) as VkIdStore;
+    return JSON.parse(fs.readFileSync(tokenFile(), "utf8")) as VkIdStore;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      logger.error(`[vkid] cannot read ${TOKEN_FILE}: ${String(error)}`);
+      logger.error(`[vkid] cannot read ${tokenFile()}: ${String(error)}`);
     }
     return null;
   }
@@ -103,12 +112,12 @@ function readStore(): VkIdStore | null {
  * BEFORE the rename, so the token is never briefly world-readable.
  */
 export function writeStore(store: VkIdStore): void {
-  const dir = path.dirname(TOKEN_FILE);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${TOKEN_FILE}.${process.pid}.tmp`;
+  const file = tokenFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
   fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, TOKEN_FILE);
+  fs.renameSync(tmp, file);
 }
 
 /** A state value satisfying VK ID's "at least 32 chars of [a-zA-Z0-9_-]". */
@@ -130,8 +139,8 @@ export function createPkce(): { verifier: string; challenge: string } {
 export function buildAuthorizeUrl(challenge: string, state: string): string {
   const params = new URLSearchParams({
     response_type: "code",
-    client_id: APP_ID,
-    redirect_uri: REDIRECT_URI,
+    client_id: appId(),
+    redirect_uri: redirectUri(),
     scope: VKID_SCOPE,
     state,
     code_challenge: challenge,
@@ -204,9 +213,9 @@ export async function exchangeCode(
     grant_type: "authorization_code",
     code,
     code_verifier: codeVerifier,
-    client_id: APP_ID,
+    client_id: appId(),
     device_id: deviceId,
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: redirectUri(),
     // VK ID lists state as required here, not just on /authorize, and it must
     // be the value the authorization started with.
     state,
@@ -230,7 +239,7 @@ async function refreshAccessToken(store: VkIdStore): Promise<string | null> {
     const token = await postToken({
       grant_type: "refresh_token",
       refresh_token: store.refreshToken,
-      client_id: APP_ID,
+      client_id: appId(),
       device_id: store.deviceId,
       state: randomState(),
     });
@@ -255,7 +264,7 @@ async function refreshAccessToken(store: VkIdStore): Promise<string | null> {
  * expected to carry on without the picture.
  */
 export async function getVkUserAccessToken(): Promise<string | null> {
-  if (!APP_ID) return null;
+  if (!appId()) return null;
 
   const store = readStore();
   if (!store?.refreshToken) return null;
@@ -311,7 +320,7 @@ export async function uploadWallPhoto(
 
 /** One-line status for the boot log; deliberately says nothing about values. */
 export function vkUserStatus(): string {
-  if (!APP_ID) return "not configured (VKID_APP_ID unset)";
+  if (!appId()) return "not configured (VKID_APP_ID unset)";
   const store = readStore();
   if (!store?.refreshToken) return `no grant stored — run \`npm run vkidlogin\``;
   return `authorized as user ${store.userId}, scope "${store.scope}"`;
