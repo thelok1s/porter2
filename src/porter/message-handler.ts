@@ -23,8 +23,9 @@ type DiscussionMessage = Message & {
 };
 
 const CHAT_ID = String(tgChatId ?? "");
-// Telegram represents channel ids in forwards as "-100" + <channel id>.
-const CHANNEL_PREFIX = "-100" + String(tgChannelId ?? "");
+// `tgChannelId` is already normalised to Telegram's full "-100…" form, which
+// is exactly what forward_from_chat.id reports.
+const CHANNEL_PREFIX = String(tgChannelId ?? "");
 
 const composer = new Composer<BotContext>();
 
