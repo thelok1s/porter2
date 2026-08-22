@@ -1,5 +1,6 @@
 import type { InputPeerLike } from "@mtcute/core";
 import { getMtprotoClient, type MtprotoClient } from "@/lib/mtproto";
+import { bot } from "@/core/bot";
 import logger from "@/lib/logger";
 
 /**
@@ -101,16 +102,56 @@ async function resolveChat(
 }
 
 /**
+ * Administrators only, over the plain Bot API.
+ *
+ * `getChatAdministrators` is the one roster-ish method a bot token can call,
+ * and it works even with privacy mode on, so it is the honest degraded answer
+ * when MTProto is unavailable — far better than reporting nothing at all, which
+ * is what a chat with no MTProto credentials used to get.
+ *
+ * Never `complete`: this is a subset by construction, and callers that prune
+ * records based on absence must not treat it as the full membership.
+ */
+async function fetchAdminsViaBotApi(
+  chatId: number | string,
+): Promise<ChatRoster | null> {
+  try {
+    const admins = await bot.api.getChatAdministrators(chatId);
+    const participants: ChatParticipant[] = admins.map((m) => ({
+      userId: m.user.id,
+      username: m.user.username ?? null,
+      firstName: m.user.first_name ?? null,
+      isBot: m.user.is_bot,
+      isDeleted: false,
+    }));
+    if (participants.length === 0) return null;
+    logger.info(
+      `[participants] ${chatId}: ${participants.length} admins via Bot API ` +
+        "(MTProto unavailable — admins only, not the full roster)",
+    );
+    return { participants, complete: false };
+  } catch (error) {
+    logger.warn(
+      `[participants] Bot API admin lookup failed for ${chatId}: ${String(error)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Every member of `chatId`, as far as Telegram will report them.
  *
- * @returns the roster, or `null` when MTProto is unconfigured or the lookup
- *   failed — the caller should fall back to whatever it already knows.
+ * Falls back to administrators over the Bot API when MTProto is unconfigured or
+ * its lookup fails, so the capability degrades rather than disappearing. Check
+ * `complete` before treating the result as the whole membership.
+ *
+ * @returns the roster, or `null` when even the admin lookup is unavailable.
  */
 export async function fetchChatParticipants(
   chatId: number | string,
 ): Promise<ChatRoster | null> {
   const tg = await getMtprotoClient();
-  if (!tg) return null;
+  if (!tg) return fetchAdminsViaBotApi(chatId);
 
   try {
     const peer = await resolveChat(tg, chatId);
@@ -167,8 +208,9 @@ export async function fetchChatParticipants(
     return { participants: [...collected.values()], complete };
   } catch (error) {
     logger.warn(
-      `[participants] could not list members of ${chatId}: ${String(error)}`,
+      `[participants] could not list members of ${chatId}: ${String(error)} ` +
+        "— falling back to admins",
     );
-    return null;
+    return fetchAdminsViaBotApi(chatId);
   }
 }
