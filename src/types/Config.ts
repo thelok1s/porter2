@@ -91,6 +91,28 @@ export interface Config {
     | {
         enabled: false;
       };
+
+  /**
+   * `/health` — an operator-facing status readout in Telegram.
+   *
+   * OFF by default and deliberately so: it reports on live credentials and
+   * infrastructure, so it should be a decision to expose rather than something
+   * a deployment inherits. Access is still gated at call time — moderators get
+   * a summary, only SUPER_ADMIN_ID sees detail — but the flag is the outer
+   * boundary.
+   */
+  health?: {
+    enabled: boolean;
+    /**
+     * Whether the command answers in group chats as well as DMs. Group replies
+     * are visible to everyone present, so even the brief form leaks which
+     * services exist; DM-only is the cautious setting.
+     *
+     * Flat rather than a discriminated union so the setting can be configured
+     * while the feature is still off, ready for whenever it is turned on.
+     */
+    allowInGroups?: boolean;
+  };
 }
 
 /**

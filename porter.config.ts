@@ -67,6 +67,13 @@ const PorterConfig: Config = {
     origin: "both",
   },
 
+  // Operator status readout. Off by default — it reports on live credentials
+  // and infrastructure, so exposing it should be a choice, not an inheritance.
+  health: {
+    enabled: false,
+    allowInGroups: true,
+  },
+
   api: {
     enabled: true,
     port: num(process.env.PORTER_API_PORT ?? process.env.API_PORT, 5050),

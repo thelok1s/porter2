@@ -5,6 +5,7 @@ import logger from "@/lib/logger";
 
 // ── Committed core module ─────────────────────────────────────────────────
 import porter from "@/porter";
+import healthCommand from "@/health";
 
 // ── Private local modules (gitignored under local/) ───────────────────────
 import allCommand from "@local/all-command";
@@ -46,6 +47,7 @@ function normalize(name: string, exp: ModuleExport): ModuleDefinition {
  * order for clarity.
  */
 const MODULES: ModuleDefinition[] = [
+  normalize("health", healthCommand), // commands only → falls through
   normalize("all-command", allCommand), // commands only → falls through
   normalize("porter", porter), // crossposting / crosscommenting
   normalize("frontend", frontend), // Express API + moderation callbacks
