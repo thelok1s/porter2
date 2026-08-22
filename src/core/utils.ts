@@ -113,11 +113,37 @@ function convertVkLinksToHtml(text: string): string {
   return safeText;
 }
 
+/**
+ * Escape text destined for Telegram's HTML parse mode.
+ *
+ * Covers attribute context too (quotes), so one helper serves both the label
+ * and the href.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Build an anchor for Telegram HTML.
+ *
+ * Both arguments are escaped: the label is a VK display name, and VK community
+ * names accept `<`, `>` and `&` freely. Interpolating one raw let a community
+ * called `<b>x</b>` inject markup into a ported comment — and an unbalanced tag
+ * makes Telegram reject the whole message ("can't parse entities"), so the
+ * comment is lost rather than merely mangled. Personal names are restricted to
+ * letters, which is why this stayed latent until community names began
+ * resolving here.
+ */
 function getHtmlLink(url: string, text: string): string {
   if (url && !url.startsWith("http") && !url.startsWith("//")) {
     url = "https://" + url;
   }
-  return `<a href="${url}">${text}</a>`;
+  return `<a href="${escapeHtml(url)}">${escapeHtml(text)}</a>`;
 }
 
 function formatMessageText(text: string, useHtml: boolean = true): string {
