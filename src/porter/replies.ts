@@ -45,9 +45,14 @@ async function resolveSender(fromId: number | null | undefined): Promise<Sender>
       const res = (await vkGlobalApi.groups.getById({
         group_id: String(Math.abs(fromId)),
       })) as unknown;
-      const group = Array.isArray(res)
-        ? (res[0] as { id?: number; name?: string } | undefined)
-        : undefined;
+      // Two response shapes in the wild: VK API < 5.131 returns a bare array,
+      // >= 5.131 wraps it as { groups: [...] }. vk-io defaults to 5.199, so the
+      // array-only read always missed and every community commenter silently
+      // became "Сообщество". Accept both rather than pinning a version.
+      const list = Array.isArray(res)
+        ? res
+        : ((res as { groups?: unknown[] } | null)?.groups ?? []);
+      const group = list[0] as { id?: number; name?: string } | undefined;
       if (group?.name) return { id: fromId, first_name: group.name, last_name: "" };
     } catch {
       // fall through to fallback
