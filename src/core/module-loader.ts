@@ -53,6 +53,16 @@ const MODULES: ModuleDefinition[] = [
   normalize("frontend", frontend), // Express API + moderation callbacks
 ];
 
+/**
+ * The mounted module manifest, for features that report on the running system.
+ *
+ * Returns names in mount order — the order matters to behaviour (see the
+ * ordering rationale above), so a report that lists them should not sort.
+ */
+export function listModules(): { name: string; hasComposer: boolean }[] {
+  return MODULES.map((m) => ({ name: m.name, hasComposer: !!m.composer }));
+}
+
 /** Run every module's init hook (after DB init, before launch). */
 export async function initModules(): Promise<void> {
   for (const m of MODULES) {
