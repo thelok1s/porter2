@@ -299,12 +299,16 @@ async function main(): Promise<void> {
   }
   console.log();
 
-  let url =
+  const authorizeUrl =
     `https://${HOST}/authorize?client_id=${APP_ID}&scope=${SCOPE}` +
     `&redirect_uri=https://${HOST}/blank.html&response_type=token&v=${API_VERSION}`;
+  let url = authorizeUrl;
 
   let token: string | null = null;
   let expiresIn: number | null = null;
+  // Two signals that between them explain a chain that ends without a token.
+  let sawGrantAccess = false;
+  let errCode: string | null = null;
 
   for (let hop = 1; hop <= 8; hop++) {
     const res: Response = await fetch(url, {
@@ -345,6 +349,13 @@ async function main(): Promise<void> {
           process.exit(1);
         }
       }
+      // Reaching act=grant_access means the session WAS accepted and VK moved
+      // on to consent — the app simply has no OAuth-side grant yet. A Mini App
+      // approval given through VK Bridge is a separate record and does not
+      // count here.
+      if (/act=grant_access/.test(location)) sawGrantAccess = true;
+      const errMatch = /[?&]err=(\d+)/.exec(location);
+      if (errMatch) errCode = errMatch[1];
       url = new URL(location, url).toString();
       continue;
     }
@@ -354,13 +365,47 @@ async function main(): Promise<void> {
       console.log(`\nFAILED — VK answered ${res.status}: ${body.slice(0, 300)}`);
       process.exit(1);
     }
+    // blank.html is where VK dumps you after an error it already swallowed, so
+    // it is a terminus rather than a page worth classifying. The reason is in
+    // the redirects that led here.
+    if (/\/blank\.html/.test(url)) break;
     console.log(`\nSTOPPED — ${classifyHtml(body)}`);
     console.log(`\n(first 400 bytes)\n${body.replace(/\s+/g, " ").slice(0, 400)}`);
     process.exit(1);
   }
 
   if (!token) {
-    console.log("\nFAILED — redirect chain ended without a token.");
+    const meaning: Record<string, string> = {
+      "1": 'invalid_request — VK calls it a "strange request"',
+      "2": "Security Error — what VK returns when act=grant_access is reached " +
+        "without an interactive confirmation",
+      "3": "invalid_scope — standalone apps must use blank.html as redirect_uri",
+    };
+    if (errCode) {
+      console.log(`\nVK error err=${errCode}: ${meaning[errCode] ?? "unknown code"}`);
+    }
+    if (sawGrantAccess) {
+      console.log(
+        "\nSTOPPED — CONSENT NOT YET GRANTED (and the session is FINE).\n\n" +
+          "The chain reached act=grant_access, which means VK accepted these\n" +
+          "cookies and identified you — the part that had to work, works. It\n" +
+          "then wanted a consent screen, and nothing here can click it.\n\n" +
+          "Approving through the Mini App does NOT satisfy this: a VK Bridge\n" +
+          "grant and an OAuth grant are separate records.\n\n" +
+          "Open this once, signed in as the community admin, and press\n" +
+          '"Разрешить":\n\n' +
+          `  ${authorizeUrl}&display=page\n\n` +
+          "You land on a blank.html whose address bar holds\n" +
+          "#access_token=… — that token is live now, so you can install it\n" +
+          "immediately and unbreak photo posting.\n\n" +
+          "Then re-run this probe. With the grant on record VK should skip\n" +
+          "consent and hand the token straight back, which is exactly what\n" +
+          "unattended renewal needs.",
+      );
+      process.exit(2);
+    }
+    console.log("\nFAILED — redirect chain ended without a token, and without " +
+      "reaching consent. See the hops above.");
     process.exit(1);
   }
 
