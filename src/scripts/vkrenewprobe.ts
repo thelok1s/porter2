@@ -499,8 +499,16 @@ async function main(): Promise<void> {
 
   console.log(`VK token renewal probe — app ${APP_ID}, scope "${SCOPE}", via ${HOST}\n`);
   console.log(`cookies: ${names.length} loaded from ${cookieFile()}  (${parsed.format})`);
-  if (!names.some((n) => /^remixsid/.test(n))) {
-    console.log("         WARNING: no remixsid — that is the session cookie.");
+  console.log(`         ${names.join(", ")}`);
+  // Which cookies are present is the first thing to check when two endpoints
+  // disagree about the same jar, so keep listing them.
+  for (const [name, role] of [
+    ["remixsid", "the session itself"],
+    ["httoken", "VK's anti-CSRF token for login.vk.* actions"],
+  ] as const) {
+    if (!names.some((n) => n === name || n.startsWith(name))) {
+      console.log(`         MISSING ${name} — ${role}`);
+    }
   }
   console.log();
 
