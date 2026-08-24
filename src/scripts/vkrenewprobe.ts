@@ -409,6 +409,83 @@ async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promis
   return out;
 }
 
+/**
+ * Recursively find an access token in a response of unknown shape.
+ *
+ * `act=web_token` is undocumented, so its success envelope is whatever VK
+ * happens to send. Searching for the key beats hardcoding a path that moves.
+ */
+function findToken(value: unknown): { token?: string; expires?: number } {
+  const found: { token?: string; expires?: number } = {};
+  const visit = (v: unknown): void => {
+    if (!v || typeof v !== "object") return;
+    for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+      if (k === "access_token" && typeof child === "string") found.token = child;
+      else if ((k === "expires" || k === "expires_in") && typeof child === "number")
+        found.expires = child;
+      else visit(child);
+    }
+  };
+  visit(value);
+  return found;
+}
+
+/**
+ * The call VK's web client makes to implement VKWebAppGetAuthToken.
+ *
+ * Much better suited to unattended use than replaying the OAuth consent chain:
+ * one request, a JSON answer, and no grant_access step to be refused at. It is
+ * why re-opening an already-approved Mini App hands back a token instantly.
+ *
+ * Two gates, measured against the live endpoint. Origin must be https://vk.ru
+ * (https://vk.com and the app's own origin both answer "wrong origin"), and
+ * then the web session decides — with no cookies it answers "unauthorized",
+ * which is a statement about the JAR, not about the endpoint.
+ */
+async function tryWebToken(jar: string, site: string): Promise<Outcome> {
+  const out: Outcome = {
+    token: null, expiresIn: null, errCode: null, sawGrantAccess: false, note: "",
+  };
+  console.log(`      GET login.${site}/?act=web_token`);
+
+  const res = await fetch(
+    `https://login.${site}/?act=web_token&app_id=${APP_ID}&scope=${SCOPE}`,
+    {
+      headers: {
+        cookie: jar,
+        origin: `https://${site}`,
+        referer: `https://${site}/`,
+        "user-agent": UA,
+        accept: "application/json, text/plain, */*",
+        "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
+      },
+    },
+  );
+
+  const text = await readBody(res);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    out.note = `non-JSON answer (${res.status}): ${text.replace(/\s+/g, " ").slice(0, 160)}`;
+    return out;
+  }
+
+  const { token, expires } = findToken(parsed);
+  if (token) {
+    out.token = token;
+    out.expiresIn = expires ?? null;
+    return out;
+  }
+
+  // Echo the envelope verbatim, minus any token. The shape is undocumented, so
+  // its error strings are the only documentation that exists.
+  out.note = JSON.stringify(parsed)
+    .replace(/"access_token":"[^"]*"/, '"access_token":"<redacted>"')
+    .slice(0, 240);
+  return out;
+}
+
 async function main(): Promise<void> {
   const verbose = process.argv.includes("--verbose");
   const parsed = loadJar();
@@ -426,6 +503,25 @@ async function main(): Promise<void> {
     console.log("         WARNING: no remixsid — that is the session cookie.");
   }
   console.log();
+
+  const site = HOST.replace(/^oauth\./, "");
+
+  // Cheapest and cleanest route first: one JSON call, no consent chain.
+  console.log("── web_token (what VKWebAppGetAuthToken calls underneath)");
+  console.log("   one JSON request; no grant_access step to be refused at");
+  const web = await tryWebToken(parsed.jar, site);
+  if (web.token) {
+    await report({ label: "web_token" } as Strategy, web);
+    return;
+  }
+  console.log(`      no token — ${web.note}\n`);
+  if (/unauthorized/i.test(web.note)) {
+    console.log(
+      '   NOTE: "unauthorized" here is about the JAR, not the endpoint. The\n' +
+        "   origin check passed and VK simply does not recognise this session,\n" +
+        "   so re-export the cookies — everything below fails the same way.\n",
+    );
+  }
 
   let winner: { strategy: Strategy; outcome: Outcome } | null = null;
   let anyGrantAccess = false;
@@ -470,17 +566,23 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const { token, expiresIn } = winner.outcome;
-  console.log(`VERDICT: unattended renewal works — via "${winner.strategy.label}".`);
-  console.log(`    fingerprint: ${fingerprint(token as string)}  (length ${(token as string).length})`);
+  await report(winner.strategy, winner.outcome);
+}
+
+/** Shared success path, so both routes report identically. */
+async function report(strategy: Strategy, outcome: Outcome): Promise<void> {
+  const token = outcome.token as string;
+  const expiresIn = outcome.expiresIn;
+  console.log(`VERDICT: unattended renewal works — via "${strategy.label}".`);
+  console.log(`    fingerprint: ${fingerprint(token)}  (length ${token.length})`);
   console.log(
-    `    expires_in:  ${expiresIn} s` +
-      (expiresIn ? ` = ${(expiresIn / 3600).toFixed(1)} h` : " — no expiry reported"),
+    `    expires_in:  ${expiresIn ?? "not reported"}` +
+      (expiresIn ? ` s = ${(expiresIn / 3600).toFixed(1)} h` : ""),
   );
 
   process.stdout.write("\n    validating against photos.getWallUploadServer … ");
   try {
-    const api = new API({ token: token as string });
+    const api = new API({ token });
     const res = (await api.photos.getWallUploadServer({
       group_id: GROUP_ID,
     })) as unknown as { upload_url?: string };
