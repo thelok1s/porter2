@@ -8,37 +8,41 @@ import { loadCookieJar } from "@/lib/vkcookies";
 /**
  * Unattended renewal of the VK user token.
  *
- * This replays the request VK's own web client makes when it needs a fresh
- * Mini App token, captured from a real logged-in session (DevTools, 2026-08):
+ * This replays the request VK's own clients make when they need a fresh Mini
+ * App token, captured twice from real logged-in sessions (DevTools, 2026-08):
  *
  *   POST https://login.vk.ru/?act=web_token
  *   Content-Type: application/x-www-form-urlencoded
  *   Cookie: <the whole vk.ru session jar>
  *   Origin/Referer: https://vk.ru/  ·  Sec-Fetch-Mode: cors
- *   body: version=1&app_id=<id>&access_token=<the token currently held>
+ *   body: version=1&app_id=<id>            ← the desktop web client: NO token
+ *         version=1&app_id=<id>&access_token=<held token>   ← the other capture
  *   → {"type":"okay","data":{"access_token":"vk1.a.…",
- *        "expires":<ABSOLUTE unix seconds>,"user_id":…,"logout_hash":"…"}}
+ *        "expires":<unix seconds>,"user_id":…,"logout_hash":"…"}}
  *
- * Three properties make this work unattended where the legacy OAuth consent
- * chain refused everything (that history lives in src/scripts/vkrenewprobe.ts):
- *   • it authenticates with the browser SESSION (the cookie jar), not with an
- *     interactive consent step, so there is no grant_access for VK to refuse
- *     to a script;
- *   • it answers JSON — nothing has to be scraped out of windows-1251 HTML;
- *   • it EXCHANGES the token already held, needing no password and no fresh
- *     approval, provided the `photos,wall` grant exists — which it does for
- *     the approved Mini App.
+ * The decisive property: authentication is the COOKIE JAR, not the body. The
+ * working capture carried no access_token at all — the session cookies (most
+ * tellingly `p`, itself a vk1.a token, alongside remixsid and httoken) are
+ * what authorizes the mint. Both body shapes are therefore tried; a partial
+ * jar that lacks the session-token cookies is refused with
+ * {"error_info":"unauthorized"}, which no body shape can talk around.
+ *
+ * Fallback: a COMPLETE jar contains usable API tokens outright — `p` is one,
+ * and `sua` embeds another between ^ separators. Those are harvested and put
+ * through the same validation gate, so a jar good enough to log in with can
+ * often restore service even when the exchange endpoint refuses.
  *
  * Two things are genuinely unknown and both are handled rather than assumed:
- *   • Whether OUR app id works in the body. The capture carried 6287487 — VK's
- *     own web client. Candidates are tried in order (ours first, then theirs),
- *     and every minted token must pass photos.getWallUploadServer before it is
- *     allowed near the store, so a token minted under the wrong app fails that
- *     check and is discarded. Fail closed: keep the old token, post text-only.
- *   • Whether the endpoint accepts an ALREADY-EXPIRED token. The capture ran
- *     with a live one in the body. Renewal therefore runs proactively while
- *     the old token still works (vktokenwatch renews from ≤18 h remaining), so
- *     the question never has to be answered in production.
+ *   • Whether OUR app id works in the body. The captures carried 6287487 —
+ *     VK's own client id. Candidates are tried in order (ours first, then
+ *     theirs), and every minted token must pass photos.getWallUploadServer
+ *     before it is allowed near the store, so a wrong-scope token is
+ *     discarded. Fail closed: keep the old token, post text-only.
+ *   • What `expires` MEANS. The one sample parsed as absolute unix seconds —
+ *     yet landed ~44 min BEFORE the response's own Date header, so trusting a
+ *     non-positive remainder would store a born-dead stamp and alarm forever.
+ *     A remainder that does not come out positive is recorded as UNKNOWN, and
+ *     age-based watching takes over.
  *
  * The token is password-grade and the cookie jar IS the account: neither is
  * ever logged, not even truncated — failures quote only VK's redacted error
@@ -50,8 +54,8 @@ const ENDPOINT = "https://login.vk.ru/?act=web_token";
 const ORIGIN = "https://vk.ru";
 
 /**
- * The app id VK's web client uses for itself — what the original capture
- * carried. A fallback candidate when our own app id is refused.
+ * The app id VK's web client uses for itself — what both captures carried. A
+ * fallback candidate when our own app id is refused.
  */
 export const WEB_CLIENT_APP_ID = 6287487;
 
@@ -78,21 +82,29 @@ function wallGroupId(): number | null {
 
 export interface WebTokenGrant {
   token: string;
-  /** Seconds until VK says this token dies; null when unreported. */
+  /**
+   * Seconds until VK says this token dies; null when unreported OR when the
+   * arithmetic lands non-positive — see the header comment on `expires`.
+   */
   secondsRemaining: number | null;
 }
 
 /**
- * `expires` semantics are undocumented; the one captured sample was absolute
- * unix seconds. A relative lifetime would read as a date in early 1970, so
- * magnitude disambiguates: anything plausibly a timestamp (> 1e9, i.e. after
- * 2001) is absolute, anything smaller is seconds-left.
+ * Interpret an undocumented expiry figure.
+ *
+ * Absolute-vs-relative disambiguation by magnitude: a relative lifetime would
+ * read as a 1970 date, so anything plausibly a timestamp (> 1e9) is absolute.
+ * A non-positive result is NOT clamped to zero and returned — it means the
+ * field meant something other than "dies at", and recording it would have the
+ * watchdog declare a freshly validated token expired. Unknown beats wrong.
  */
 function secondsRemaining(rawExpiry: number | undefined): number | null {
   if (rawExpiry === undefined || !Number.isFinite(rawExpiry)) return null;
-  return rawExpiry > 1_000_000_000
-    ? Math.max(0, Math.round(rawExpiry - Date.now() / 1000))
-    : Math.max(0, Math.round(rawExpiry));
+  const left =
+    rawExpiry > 1_000_000_000
+      ? Math.round(rawExpiry - Date.now() / 1000)
+      : Math.round(rawExpiry);
+  return left > 0 ? left : null;
 }
 
 /**
@@ -124,6 +136,37 @@ export function parseWebTokenEnvelope(payload: unknown): WebTokenGrant | null {
   };
   visit(payload);
   return token ? { token, secondsRemaining: secondsRemaining(expiry) } : null;
+}
+
+/**
+ * Tokens sitting in plain sight inside the session jar.
+ *
+ * The working capture's cookies include `p=vk1.a.…` — the web session's own
+ * API token — and `sua=<hash>#<uid>^vk1.a.…^<timestamp>`, another one. An
+ * export complete enough to authorize web_token usually therefore also
+ * carries a directly usable token, worth trying when the endpoint refuses.
+ * Only well-formed vk1.a tokens are taken; everything else in those cookies
+ * is opaque session state.
+ */
+export function harvestJarTokens(jarHeader: string): string[] {
+  const found = new Set<string>();
+  for (const pair of jarHeader.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    const name = pair.slice(0, eq).trim();
+    if (name !== "p" && name !== "sua") continue;
+    let value = pair.slice(eq + 1).trim();
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      /* malformed escape — scan it as-is */
+    }
+    for (const piece of value.split(/[\^#]/)) {
+      const candidate = piece.trim();
+      if (/^vk1\.a\.[A-Za-z0-9._-]{20,}$/.test(candidate)) found.add(candidate);
+    }
+  }
+  return [...found];
 }
 
 const REDACTIONS: [RegExp, string][] = [
@@ -168,21 +211,31 @@ type Attempt =
   | { kind: "minted"; grant: WebTokenGrant }
   | { kind: "refused"; reason: "http" | "bad-envelope"; detail: string };
 
-async function postWebToken(
+/**
+ * One wire round-trip against the exchange. Exported so the operator tool
+ * (`vkrenewprobe`) replays attempts one by one and reports each, without
+ * keeping a second copy of the request shape.
+ */
+export async function postWebToken(
   appId: number,
-  currentToken: string,
+  bodyToken: string | null,
   jarHeader: string,
 ): Promise<{ attempt: Attempt; jarHeader: string }> {
   // Form encoding via URLSearchParams is safe here where it was NOT for the
   // oauth scope param: this body carries no commas and vk1.a tokens survive
   // percent-encoding unchanged.
+  const fields: Record<string, string> = { version: "1", app_id: String(appId) };
+  if (bodyToken) fields.access_token = bodyToken;
+
   const res = await fetch(ENDPOINT, {
     method: "POST",
     redirect: "manual",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     headers: {
       cookie: jarHeader,
-      "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+      // Exactly the captured value — the charset suffix the earlier draft sent
+      // is not something the working request carried, and fidelity is free.
+      "content-type": "application/x-www-form-urlencoded",
       origin: ORIGIN,
       referer: `${ORIGIN}/`,
       accept: "application/json, text/plain, */*",
@@ -192,11 +245,7 @@ async function postWebToken(
       "sec-fetch-site": "same-site",
       "user-agent": UA,
     },
-    body: new URLSearchParams({
-      version: "1",
-      app_id: String(appId),
-      access_token: currentToken,
-    }).toString(),
+    body: new URLSearchParams(fields).toString(),
   });
 
   const nextJar = mergeSetCookies(jarHeader, res.headers.getSetCookie?.() ?? []);
@@ -242,12 +291,13 @@ async function postWebToken(
 }
 
 /**
- * Prove a minted token can do the ONE job the user token exists for before it
- * replaces anything. `photos.getWallUploadServer` needs exactly the rights the
- * token is held for (`photos` + `wall`), creates nothing, and fails with Code 5
- * / 15 / 27 for every way a token can be wrong for us.
+ * Prove a candidate token can do the ONE job the user token exists for before
+ * it replaces anything. `photos.getWallUploadServer` needs exactly the rights
+ * the token is held for (`photos` + `wall`), creates nothing, and fails with
+ * Code 5 / 15 / 27 for every way a token can be wrong for us.
  */
-async function uploadRouteWorks(
+/** Exported for the operator tool, which reports on the same gate. */
+export async function uploadRouteWorks(
   token: string,
 ): Promise<{ ok: boolean; detail: string }> {
   const groupId = wallGroupId();
@@ -276,12 +326,13 @@ async function uploadRouteWorks(
 
 export interface VkRenewResult {
   ok: boolean;
-  /** ok | no-token | no-jar | http | bad-envelope | validation */
+  /** ok | no-jar | http | bad-envelope | validation */
   reason: string;
   /** Human detail, credential-free by construction (see redactForLogs). */
   detail: string;
   expiresInHours: number | null;
-  appId: number | null;
+  /** How the installed token was obtained — e.g. "web_token app 54703482". */
+  via: string | null;
 }
 
 let inflight: Promise<VkRenewResult> | null = null;
@@ -300,19 +351,32 @@ export function renewVkUserToken(): Promise<VkRenewResult> {
   return inflight;
 }
 
+async function install(
+  token: string,
+  secondsLeft: number | null,
+  via: string,
+): Promise<VkRenewResult> {
+  const hours = secondsLeft !== null ? secondsLeft / 3600 : null;
+  saveVkUserToken(token, secondsLeft, "renewal");
+  logger.info(
+    `[vk-renew] token renewed via ${via} (fingerprint ${fingerprint(token)}, valid ` +
+      `${hours !== null ? `${hours.toFixed(1)} h` : "for an unknown time"})`,
+  );
+  return { ok: true, reason: "ok", detail: `renewed via ${via}`, expiresInHours: hours, via };
+}
+
 async function runRenewal(): Promise<VkRenewResult> {
   const none: VkRenewResult = {
     ok: false,
     reason: "",
     detail: "",
     expiresInHours: null,
-    appId: null,
+    via: null,
   };
 
+  // Optional now: the primary body shape authenticates by cookies alone. When
+  // present it feeds only the secondary variant.
   const current = await getVkUserAccessToken();
-  if (!current) {
-    return { ...none, reason: "no-token", detail: "no user token configured to exchange" };
-  }
 
   const jar = loadCookieJar();
   if (!jar) {
@@ -325,10 +389,18 @@ async function runRenewal(): Promise<VkRenewResult> {
     };
   }
 
-  // remixsid IS the session; its absence predicts a LOGIN page, not renewal.
-  const jarNote = jar.names.some((n) => n.startsWith("remixsid"))
-    ? ""
-    : "; jar lacks remixsid — likely a partial export";
+  // remixsid IS the classic session; its absence predicts a LOGIN page. And a
+  // jar without the session-token cookies gets "unauthorized" from web_token
+  // however correct the rest is, so say so up front rather than leaving the
+  // operator to guess why a logged-in-looking export is refused.
+  const missing: string[] = [];
+  if (!jar.names.some((n) => n.startsWith("remixsid"))) missing.push("remixsid");
+  for (const critical of ["p", "sua"] as const) {
+    if (!jar.names.includes(critical)) missing.push(critical);
+  }
+  const jarNote = missing.length
+    ? `; jar lacks ${missing.join(", +")} — re-export the COMPLETE jar (HttpOnly included)`
+    : "";
 
   let failure: Pick<VkRenewResult, "reason" | "detail"> = {
     reason: "unknown",
@@ -336,59 +408,66 @@ async function runRenewal(): Promise<VkRenewResult> {
   };
 
   // Ours first: a token minted under OUR app is the one we know carries the
-  // right grants. The web client's app id exists because the capture proved
-  // the route accepts it, and validation below polices whatever scopes come back.
+  // right grants. The web client's app id exists because the captures proved
+  // the route accepts it, and validation below polices whatever scopes come
+  // back. Per app id, the cookie-only body goes first — it is the shape the
+  // proven-working desktop client sends.
   const candidates = [...new Set([configuredAppId(), WEB_CLIENT_APP_ID])];
   let jarHeader = jar.header;
 
   for (const appId of candidates) {
-    let result: { attempt: Attempt; jarHeader: string };
-    try {
-      result = await postWebToken(appId, current, jarHeader);
-    } catch (error) {
-      const timedOut = error instanceof Error && error.name === "TimeoutError";
-      failure = {
-        reason: "http",
-        detail: timedOut
-          ? `timed out after ${REQUEST_TIMEOUT_MS} ms`
-          : String(error).slice(0, 160),
-      };
-      continue;
-    }
-    jarHeader = result.jarHeader;
+    for (const bodyToken of [null, current]) {
+      let result: { attempt: Attempt; jarHeader: string };
+      try {
+        result = await postWebToken(appId, bodyToken, jarHeader);
+      } catch (error) {
+        const timedOut = error instanceof Error && error.name === "TimeoutError";
+        failure = {
+          reason: "http",
+          detail: timedOut
+            ? `timed out after ${REQUEST_TIMEOUT_MS} ms`
+            : String(error).slice(0, 160),
+        };
+        continue;
+      }
+      jarHeader = result.jarHeader;
 
-    const attempt = result.attempt;
-    if (attempt.kind !== "minted") {
-      failure = { reason: attempt.reason, detail: `${attempt.detail} (app ${appId})` };
-      continue;
-    }
+      const attempt = result.attempt;
+      if (attempt.kind !== "minted") {
+        failure = {
+          reason: attempt.reason,
+          detail: `${attempt.detail} (app ${appId}${bodyToken ? ", token-in-body" : ""})`,
+        };
+        continue;
+      }
 
-    const verdict = await uploadRouteWorks(attempt.grant.token);
+      const verdict = await uploadRouteWorks(attempt.grant.token);
+      if (!verdict.ok) {
+        failure = { reason: "validation", detail: `${verdict.detail} (app ${appId})` };
+        continue;
+      }
+
+      return await install(
+        attempt.grant.token,
+        attempt.grant.secondsRemaining,
+        `web_token app ${appId}`,
+      );
+    }
+  }
+
+  // Last resort before giving up: the jar itself may carry a usable token.
+  for (const candidate of harvestJarTokens(jarHeader)) {
+    const verdict = await uploadRouteWorks(candidate);
     if (!verdict.ok) {
       failure = {
         reason: "validation",
-        detail: `${verdict.detail} (app ${appId})`,
+        detail: `harvested jar token rejected — ${verdict.detail}`,
       };
       continue;
     }
-
-    const hours =
-      attempt.grant.secondsRemaining !== null
-        ? attempt.grant.secondsRemaining / 3600
-        : null;
-    saveVkUserToken(attempt.grant.token, attempt.grant.secondsRemaining, "renewal");
-    logger.info(
-      `[vk-renew] token renewed via act=web_token (app ${appId}, fingerprint ` +
-        `${fingerprint(attempt.grant.token)}, valid ` +
-        `${hours !== null ? `${hours.toFixed(1)} h` : "for an unknown time"})`,
-    );
-    return {
-      ok: true,
-      reason: "ok",
-      detail: `renewed via app ${appId}`,
-      expiresInHours: hours,
-      appId,
-    };
+    // No expiry is published for these; the store records it as unknown and
+    // the watchdog falls back to age.
+    return await install(candidate, null, "harvested from jar (p/sua)");
   }
 
   logger.warn(`[vk-renew] renewal failed — ${failure.reason}: ${failure.detail}${jarNote}`);

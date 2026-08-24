@@ -172,7 +172,7 @@ async function tick(): Promise<void> {
     const result = await renewVkUserToken();
     if (result.ok) {
       logger.info(
-        `[vk-watch] auto-renewal succeeded (app ${result.appId}, valid ` +
+        `[vk-watch] auto-renewal succeeded (via ${result.via ?? "?"}, valid ` +
           `${result.expiresInHours !== null ? `${result.expiresInHours.toFixed(1)} h` : "for an unknown time"})`,
       );
     } else {
