@@ -67,6 +67,15 @@ const PorterConfig: Config = {
     origin: "both",
   },
 
+  // The VK user token expires every 24h (measured: expires_in=86400) and its
+  // failure is silent — posts keep publishing, just without their photo. On by
+  // default: it reports to SUPER_ADMIN_ID alone and reveals no credential.
+  vkToken: {
+    watch: true,
+    intervalMinutes: 30,
+    warnBeforeHours: 6,
+  },
+
   // Operator status readout. Off by default — it reports on live credentials
   // and infrastructure, so exposing it should be a choice, not an inheritance.
   health: {

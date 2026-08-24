@@ -47,7 +47,7 @@ vkid.json
 .vscode/
 docs/specs/
 
-# Token fingerprint + first-use timestamp. No secret, but no reason to ship it.
+# Superseded by db/vkuser.json; kept ignored so old deployments do not commit it.
 db/vktoken.json
 
 # Exported VK browser session used to renew the user token. ACCOUNT-GRADE:

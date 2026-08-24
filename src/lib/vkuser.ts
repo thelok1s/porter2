@@ -64,64 +64,171 @@ import logger from "@/lib/logger";
  */
 const staticUserToken = (): string => (process.env.VK_USER_TOKEN ?? "").trim();
 
-/**
- * First-use bookkeeping, so "how long do these tokens live?" stops being a
- * guess.
- *
- * VK returns no expiry for a Mini App token, so the only way to learn the
- * lifetime is to measure it: record when a given token was first seen and
- * report its age when it dies. Stores a SHA-256 prefix, never the token — the
- * fingerprint is enough to notice rotation and useless to anyone who reads it.
- */
-const metaFile = (): string =>
-  path.resolve(process.env.VK_USER_TOKEN_META ?? "./db/vktoken.json");
-
 function fingerprint(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex").slice(0, 12);
 }
 
-interface TokenMeta {
-  fingerprint: string;
-  firstSeen: string;
+/**
+ * The live token, and what is known about it.
+ *
+ * Measured: these tokens carry `expires_in=86400`. A credential with a
+ * twenty-four hour life cannot have its home in a file that needs an edit and
+ * a container restart to change, so `VK_USER_TOKEN` is demoted to a BOOTSTRAP
+ * value and `db/vkuser.json` holds what is actually in use. A replacement can
+ * then take effect in-process.
+ *
+ * `envFingerprint` keeps the demotion from becoming a trap. Without it a
+ * stored token would shadow the env var forever, and an operator pasting a
+ * fresh token into `.env` would watch it be ignored with no indication why.
+ * Recording which env value the store was seeded from means a changed `.env`
+ * is recognised as an operator decision and wins.
+ */
+interface TokenRecord {
+  token: string;
+  /** ISO. When this token came into our hands — the basis for its age. */
+  obtainedAt: string;
+  /** ISO, or null when the issuer reported no expiry. */
+  expiresAt: string | null;
+  source: "env" | "renewal" | "manual";
+  /** Fingerprint of VK_USER_TOKEN at the time this record was written. */
+  envFingerprint: string | null;
 }
 
-function readMeta(): TokenMeta | null {
+const storeFile = (): string =>
+  path.resolve(process.env.VK_USER_TOKEN_STORE ?? "./db/vkuser.json");
+
+function readStore(): TokenRecord | null {
   try {
-    return JSON.parse(fs.readFileSync(metaFile(), "utf8")) as TokenMeta;
-  } catch {
+    const parsed = JSON.parse(fs.readFileSync(storeFile(), "utf8")) as TokenRecord;
+    return typeof parsed?.token === "string" && parsed.token ? parsed : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn(`[vk] token store unreadable (${storeFile()}): ${String(error)}`);
+    }
     return null;
   }
 }
 
-/** Age of the current token, recording first sight if this one is new. */
-export function tokenAge(token: string): string {
-  const fp = fingerprint(token);
-  let meta = readMeta();
-  if (meta?.fingerprint !== fp) {
-    meta = { fingerprint: fp, firstSeen: new Date().toISOString() };
-    try {
-      fs.mkdirSync(path.dirname(metaFile()), { recursive: true });
-      fs.writeFileSync(metaFile(), JSON.stringify(meta, null, 2), {
-        mode: 0o600,
-      });
-    } catch {
-      return "age unknown (could not record first use)";
-    }
+/**
+ * Persist a token record, 0600.
+ *
+ * Failures are LOGGED, never swallowed. The previous implementation returned a
+ * string on write failure and said nothing, which is why after weeks of running
+ * there was still no recorded lifetime for any token: every write had been
+ * failing silently and the report simply read "age unknown".
+ */
+function writeStore(record: TokenRecord): TokenRecord {
+  try {
+    fs.mkdirSync(path.dirname(storeFile()), { recursive: true });
+    fs.writeFileSync(storeFile(), JSON.stringify(record, null, 2), { mode: 0o600 });
+  } catch (error) {
+    logger.error(
+      `[vk] could not write the token store at ${storeFile()}: ${String(error)}. ` +
+        "The token still works this run, but its age cannot be tracked and a " +
+        "renewal will not survive a restart. Check the directory is writable " +
+        "by the container user.",
+    );
   }
-  const hours = (Date.now() - Date.parse(meta.firstSeen)) / 3_600_000;
-  return hours < 48
-    ? `first seen ${hours.toFixed(1)} h ago`
-    : `first seen ${(hours / 24).toFixed(1)} days ago`;
+  return record;
+}
+
+/** The current record: the store, unless `.env` has been changed since. */
+function resolve(): TokenRecord | null {
+  const env = staticUserToken();
+  const stored = readStore();
+  const envFp = env ? fingerprint(env) : null;
+
+  if (env && (!stored || stored.envFingerprint !== envFp)) {
+    return writeStore({
+      token: env,
+      obtainedAt: new Date().toISOString(),
+      // A token pasted in by hand carries no issue time we can trust, so its
+      // expiry is unknown rather than assumed to be a full 24 h out.
+      expiresAt: null,
+      source: "env",
+      envFingerprint: envFp,
+    });
+  }
+  return stored;
+}
+
+/**
+ * Install a new token and report what the outgoing one managed.
+ *
+ * The lifetime measurement is the point of recording `obtainedAt`: VK documents
+ * nothing about how long these last in practice, so every rotation is the only
+ * evidence available.
+ */
+export function saveVkUserToken(
+  token: string,
+  expiresInSeconds: number | null,
+  source: TokenRecord["source"],
+): void {
+  const previous = resolve();
+  if (previous) {
+    const lived = (Date.now() - Date.parse(previous.obtainedAt)) / 3_600_000;
+    logger.info(
+      `[vk] token replaced (${previous.source} → ${source}). The outgoing one ` +
+        `lived ${lived.toFixed(1)} h.`,
+    );
+  }
+  writeStore({
+    token,
+    obtainedAt: new Date().toISOString(),
+    expiresAt: expiresInSeconds
+      ? new Date(Date.now() + expiresInSeconds * 1000).toISOString()
+      : null,
+    source,
+    envFingerprint: previous?.envFingerprint ?? null,
+  });
+}
+
+export interface VkUserTokenInfo {
+  present: boolean;
+  source: TokenRecord["source"] | null;
+  ageHours: number | null;
+  /** Hours until expiry; null when the issuer reported none. */
+  remainingHours: number | null;
+  expiresAt: string | null;
+}
+
+/** What the operator report and the watchdog both need. */
+export function vkUserTokenInfo(): VkUserTokenInfo {
+  const record = resolve();
+  if (!record) {
+    return { present: false, source: null, ageHours: null, remainingHours: null, expiresAt: null };
+  }
+  return {
+    present: true,
+    source: record.source,
+    ageHours: (Date.now() - Date.parse(record.obtainedAt)) / 3_600_000,
+    remainingHours: record.expiresAt
+      ? (Date.parse(record.expiresAt) - Date.now()) / 3_600_000
+      : null,
+    expiresAt: record.expiresAt,
+  };
+}
+
+/** Human-readable age of the current token. */
+export function tokenAge(_token?: string): string {
+  const { present, ageHours } = vkUserTokenInfo();
+  if (!present || ageHours === null) return "age unknown";
+  return ageHours < 48
+    ? `obtained ${ageHours.toFixed(1)} h ago`
+    : `obtained ${(ageHours / 24).toFixed(1)} days ago`;
 }
 
 /** Whether a user token is available at all. */
 export function isVkUserConfigured(): boolean {
-  return staticUserToken() !== "";
+  return resolve() !== null;
 }
 
 /** The user token, or null when none is configured. */
 export async function getVkUserAccessToken(): Promise<string | null> {
-  return staticUserToken() || null;
+  // A token we believe expired is still returned: the computed expiry depends
+  // on this host's clock, and VK's own answer is the authority. Better one
+  // wasted call with a definitive error than a self-inflicted outage.
+  return resolve()?.token ?? null;
 }
 
 /**
@@ -186,8 +293,14 @@ export async function uploadWallPhoto(
 
 /** One-line status for the boot log; deliberately says nothing about values. */
 export function vkUserStatus(): string {
-  const token = staticUserToken();
-  return token
-    ? `VK_USER_TOKEN set — wall photos enabled (${tokenAge(token)})`
-    : "no VK_USER_TOKEN — posts will go out text-only";
+  const info = vkUserTokenInfo();
+  if (!info.present) return "no user token — posts will go out text-only";
+
+  const left =
+    info.remainingHours === null
+      ? "expiry unknown"
+      : info.remainingHours > 0
+        ? `${info.remainingHours.toFixed(1)} h left`
+        : "EXPIRED";
+  return `user token from ${info.source} — wall photos enabled (${tokenAge()}, ${left})`;
 }

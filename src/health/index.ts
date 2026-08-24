@@ -8,7 +8,11 @@ import { vkGlobalApi } from "@/core/api";
 import { listModules } from "@/core/module-loader";
 import { sequelize, DB_FILE } from "@/lib/sequelize";
 import { isMtprotoConfigured, getMtprotoClient } from "@/lib/mtproto";
-import { isVkUserConfigured, getVkUserAccessToken } from "@/lib/vkuser";
+import {
+  isVkUserConfigured,
+  getVkUserAccessToken,
+  vkUserTokenInfo,
+} from "@/lib/vkuser";
 import logger from "@/lib/logger";
 import {
   render,
@@ -264,14 +268,34 @@ async function checkVkUser(): Promise<Check> {
     if (res === TIMED_OUT) {
       return { ...base, verdict: "fail", summary: "timed out" };
     }
+    if (!res.value?.upload_url) {
+      return { ...base, verdict: "warn", summary: "no upload_url", ms: res.ms };
+    }
+
+    // Reachable is not the same as healthy. These tokens last 24h, so one that
+    // works right now can still be hours from taking the photos off every post,
+    // and a report that only says "reachable" would call that green.
+    const info = vkUserTokenInfo();
+    const detail = [
+      `target group: ${link(`https://vk.ru/club${groupId}`, `-${groupId}`)}`,
+      `source: ${code(info.source ?? "unknown")}`,
+      `age: ${code(info.ageHours !== null ? `${info.ageHours.toFixed(1)} h` : "unknown")}`,
+      `expires: ${code(
+        info.remainingHours === null
+          ? "not reported"
+          : `in ${info.remainingHours.toFixed(1)} h`,
+      )}`,
+    ];
+
+    const soon = info.remainingHours !== null && info.remainingHours <= 6;
     return {
       ...base,
-      verdict: res.value?.upload_url ? "ok" : "warn",
-      summary: res.value?.upload_url
-        ? "upload route reachable"
-        : "no upload_url",
+      verdict: soon ? "warn" : "ok",
+      summary: soon
+        ? `upload route reachable, but expires in ${info.remainingHours!.toFixed(1)} h`
+        : "upload route reachable",
       ms: res.ms,
-      detail: [`target group: ${link(`https://vk.ru/club${groupId}`, `-${groupId}`)}`],
+      detail,
     };
   } catch (error) {
     const err = error as { code?: number; message?: string };

@@ -101,6 +101,28 @@ export interface Config {
    * a summary, only SUPER_ADMIN_ID sees detail — but the flag is the outer
    * boundary.
    */
+  /**
+   * Watch the VK user token and say something before photos start disappearing.
+   *
+   * These tokens carry `expires_in=86400`, so the failure is not an edge case —
+   * it is a daily certainty. Without a watch the only symptom is posts quietly
+   * publishing without their picture, which nothing alerts on and nobody
+   * notices for a while.
+   *
+   * On by default, unlike `/health`: this reports to the owner alone and
+   * reveals no credential, so there is nothing here to expose by inheriting it.
+   */
+  vkToken?: {
+    watch: boolean;
+    /** How often to look, in minutes. Default 30. */
+    intervalMinutes?: number;
+    /**
+     * Warn once fewer than this many hours remain. Default 6 — enough notice
+     * to act without the warning arriving so early it becomes background noise.
+     */
+    warnBeforeHours?: number;
+  };
+
   health?: {
     enabled: boolean;
     /**

@@ -11,6 +11,7 @@ import {
 } from "@/core/module-loader";
 import { closeMtproto, getMtprotoClient, isMtprotoConfigured } from "@/lib/mtproto";
 import { vkUserStatus } from "@/lib/vkuser";
+import { startVkTokenWatch, stopVkTokenWatch } from "@/lib/vktokenwatch";
 import { appFiglet } from "@/utils/appFiglet";
 import logger from "@/lib/logger";
 
@@ -134,6 +135,9 @@ async function main(): Promise<void> {
   // blocking bot.start().
   await startModules();
 
+  // After the modules, so the first alert has a working bot to send through.
+  startVkTokenWatch();
+
   logger.info("Bot started successfully (･ω<)☆");
 
   // bot.start() blocks until bot.stop(); run it un-awaited so signal handlers
@@ -159,6 +163,7 @@ async function shutdown(signal: string): Promise<void> {
   logger.warn(`Shutting down (${signal})`);
   try {
     bot.stop();
+    stopVkTokenWatch();
     await stopModules(); // LIFO: frontend → porter → all-command
     await closeMtproto();
     await closeDatabase();
