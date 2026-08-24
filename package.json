@@ -18,7 +18,8 @@
     "prune": "tsx src/scripts/prunedb.ts",
     "vkprobe": "tsx src/scripts/vkphotoprobe.ts",
     "vkuserprobe": "tsx src/scripts/vkuserprobe.ts",
-    "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59"
+    "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59",
+    "vkrenewprobe": "tsx src/scripts/vkrenewprobe.ts"
   },
   "dependencies": {
     "@mtcute/bun": "^0.31.0",

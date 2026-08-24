@@ -49,3 +49,8 @@ docs/specs/
 
 # Token fingerprint + first-use timestamp. No secret, but no reason to ship it.
 db/vktoken.json
+
+# Exported VK browser session used to renew the user token. ACCOUNT-GRADE:
+# whoever holds this IS the account. Never commit.
+db/vkcookies.txt
+db/vkuser.json

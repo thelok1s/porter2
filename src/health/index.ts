@@ -416,7 +416,7 @@ async function handleHealth(ctx: BotContext): Promise<void> {
 
   const { allowed, detailed } = await authorize(ctx);
   if (!allowed) {
-    await ctx.reply("Эта команда только для админов.");
+    await ctx.reply("Не хочу, вы не модератор");
     return;
   }
 
