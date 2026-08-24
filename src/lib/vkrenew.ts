@@ -139,14 +139,25 @@ export function parseWebTokenEnvelope(payload: unknown): WebTokenGrant | null {
 }
 
 /**
+ * Tokens sitting in plain sight inside the session jar — see harvestJarTokens
+ * for which cookies qualify.
+ *
+ * `remixsid` is the classic session itself; a jar without it reads as
+ * logged-out. The carriers are where sessions keep their API token: older
+ * ones used `p`/`sua`, newer exports stash it in `remixnsid`/`remixnttpid`.
+ */
+export const JAR_HARD_REQUIREMENTS = ["remixsid"];
+export const JAR_TOKEN_CARRIERS = ["p", "sua", "remixnsid", "remixnttpid"];
+
+/**
  * Tokens sitting in plain sight inside the session jar.
  *
  * The working capture's cookies include `p=vk1.a.…` — the web session's own
- * API token — and `sua=<hash>#<uid>^vk1.a.…^<timestamp>`, another one. An
- * export complete enough to authorize web_token usually therefore also
- * carries a directly usable token, worth trying when the endpoint refuses.
- * Only well-formed vk1.a tokens are taken; everything else in those cookies
- * is opaque session state.
+ * API token — and `sua=<hash>#<uid>^vk1.a.…^<timestamp>`, another one. Newer
+ * sessions keep theirs elsewhere: a fresh Chrome export (2026-08) stashed
+ * ready vk1.a tokens in `remixnsid` and `remixnttpid` instead. All four are
+ * scanned. Only well-formed vk1.a tokens are taken; everything else in those
+ * cookies is opaque session state.
  */
 export function harvestJarTokens(jarHeader: string): string[] {
   const found = new Set<string>();
@@ -154,7 +165,7 @@ export function harvestJarTokens(jarHeader: string): string[] {
     const eq = pair.indexOf("=");
     if (eq <= 0) continue;
     const name = pair.slice(0, eq).trim();
-    if (name !== "p" && name !== "sua") continue;
+    if (!JAR_TOKEN_CARRIERS.includes(name)) continue;
     let value = pair.slice(eq + 1).trim();
     try {
       value = decodeURIComponent(value);
@@ -390,17 +401,21 @@ async function runRenewal(): Promise<VkRenewResult> {
   }
 
   // remixsid IS the classic session; its absence predicts a LOGIN page. And a
-  // jar without the session-token cookies gets "unauthorized" from web_token
-  // however correct the rest is, so say so up front rather than leaving the
+  // jar with no token-carrier cookie gets "unauthorized" from web_token and
+  // has nothing to harvest either, so say so up front rather than leaving the
   // operator to guess why a logged-in-looking export is refused.
-  const missing: string[] = [];
-  if (!jar.names.some((n) => n.startsWith("remixsid"))) missing.push("remixsid");
-  for (const critical of ["p", "sua"] as const) {
-    if (!jar.names.includes(critical)) missing.push(critical);
+  const missingHard = JAR_HARD_REQUIREMENTS.filter(
+    (need) => !jar.names.some((n) => n.startsWith(need)),
+  );
+  const carriers = JAR_TOKEN_CARRIERS.filter((c) => jar.names.includes(c));
+  let jarNote = "";
+  if (missingHard.length || carriers.length === 0) {
+    const bits: string[] = [];
+    if (missingHard.length) bits.push(`jar lacks ${missingHard.join(", ")}`);
+    if (carriers.length === 0)
+      bits.push(`no token-carrier cookie (${JAR_TOKEN_CARRIERS.join("/")})`);
+    jarNote = `; ${bits.join("; ")} — re-export the COMPLETE jar (HttpOnly included)`;
   }
-  const jarNote = missing.length
-    ? `; jar lacks ${missing.join(", +")} — re-export the COMPLETE jar (HttpOnly included)`
-    : "";
 
   let failure: Pick<VkRenewResult, "reason" | "detail"> = {
     reason: "unknown",

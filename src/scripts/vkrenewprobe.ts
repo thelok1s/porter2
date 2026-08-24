@@ -8,6 +8,8 @@ import {
   postWebToken,
   uploadRouteWorks,
   harvestJarTokens,
+  JAR_HARD_REQUIREMENTS,
+  JAR_TOKEN_CARRIERS,
   WEB_CLIENT_APP_ID,
 } from "../lib/vkrenew";
 
@@ -55,10 +57,17 @@ const HELP = `Create the jar from a logged-in VK tab, saved at db/vkcookies.txt
      What Cookie-Editor and EditThisCookie produce: an array of
      {"name": ..., "value": ...} objects. Paste it in unchanged.
 
-Export the WHOLE jar from the SAME tab that talks to vk.ru, and make sure it
-contains \`p\`, \`sua\` and \`remixsid\` — web_token answers "unauthorized"
-without them no matter how fresh everything else is. HttpOnly cookies are part
-of the jar; an export method that cannot see them is the wrong method.`;
+  D. DevTools cookies table
+     Application tab -> Cookies -> select the rows -> Cmd/Ctrl-C. Tab-
+     separated columns (name, value, domain, path, expiry, ...). Paste in
+     unchanged — and select the WHOLE list, not just the rows in view.
+
+Export the WHOLE jar from the SAME tab that talks to vk.ru. \`remixsid\` must
+be there, plus at least ONE token-carrier cookie — sessions keep their API
+token in \`p\`/\`sua\` (older) or \`remixnsid\`/\`remixnttpid\` (newer).
+Without any carrier, web_token answers "unauthorized" and there is nothing to
+harvest either. HttpOnly cookies are part of the jar; an export method that
+cannot see them is the wrong method.`;
 
 const fingerprint = (t: string): string =>
   crypto.createHash("sha256").update(t).digest("hex").slice(0, 12);
@@ -121,15 +130,25 @@ async function main(): Promise<void> {
 
   // Which cookies are present decides everything downstream, so audit before
   // attempting: each missing name maps to a specific, known failure mode.
-  const missing = ["remixsid", "httoken", "p", "sua"].filter(
+  const missingHard = JAR_HARD_REQUIREMENTS.filter(
     (need) => !names.some((n) => n === need || n.startsWith(need)),
   );
-  if (missing.length) {
-    console.log(`         MISSING: ${missing.join(", ")}`);
-    console.log(
-      "         web_token needs these session cookies; without them it answers" +
-        '\n         "unauthorized". Re-export the COMPLETE jar (see below).',
-    );
+  const carriers = JAR_TOKEN_CARRIERS.filter((c) => names.includes(c));
+  if (missingHard.length || carriers.length === 0) {
+    if (missingHard.length) {
+      console.log(`         MISSING: ${missingHard.join(", ")}`);
+      console.log("         without it the jar reads as logged-out.");
+    }
+    if (carriers.length === 0) {
+      console.log(
+        `         no token-carrier cookie (${JAR_TOKEN_CARRIERS.join(", ")}).\n` +
+          "         The session keeps its API token in one of these — older\n" +
+          "         sessions in p/sua, newer exports in remixnsid/remixnttpid.\n" +
+          '         Without any, web_token answers "unauthorized" and the\n' +
+          "         harvest fallback has nothing to try.",
+      );
+    }
+    console.log("         Fix: re-export the COMPLETE jar (see below).");
   }
   console.log();
 

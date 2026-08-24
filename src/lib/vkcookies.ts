@@ -6,7 +6,7 @@ import path from "path";
  *
  * The renewal path replays what VK's own web client does, so it needs the
  * user's session cookies. People export those with whatever tool is at hand, so
- * three formats are accepted and detected rather than demanded — getting the
+ * four formats are accepted and detected rather than demanded — getting the
  * format wrong otherwise looks exactly like a logged-out session, which sends
  * the diagnosis in the wrong direction. Shared by the runtime renewer and the
  * `vkrenewprobe` script so there is one parser to trust.
@@ -60,6 +60,26 @@ export function parseCookieJar(raw: string): CookieJar | null {
       if (!item?.name) continue;
       pairs.set(item.name, item.value ?? "");
       if (item.domain) domains.add(item.domain.replace(/^\./, ""));
+    }
+  } else if (
+    text.split("\n").some((l) => {
+      const f = l.split("\t");
+      return f.length >= 5 && /^\d{4}-\d{2}-\d{2}T/.test((f[4] ?? "").trim());
+    })
+  ) {
+    // DevTools "Application → Cookies" table, copied row-wise: each line is
+    // name ␉ value ␉ domain ␉ path ␉ expires(ISO) ␉ size ␉ flags…. The ISO
+    // stamp in the fifth column separates it from Netscape, whose fifth
+    // column is a unix epoch. Only the leading columns matter; the flag
+    // columns shift between Chrome versions and are ignored.
+    format = "DevTools cookies table";
+    for (const line of text.split("\n")) {
+      const fields = line.split("\t").map((c) => c.trim());
+      if (fields.length < 5 || !/^\d{4}-\d{2}-\d{2}T/.test(fields[4])) continue;
+      const [name, value, domain] = fields;
+      if (!name) continue;
+      pairs.set(name, value ?? "");
+      if (domain) domains.add(domain.replace(/^\./, ""));
     }
   } else if (/^[^\s#][^\n]*\t/m.test(text) || /^# Netscape/i.test(text)) {
     format = "Netscape cookies.txt";
