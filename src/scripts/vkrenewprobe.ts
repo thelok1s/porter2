@@ -263,14 +263,157 @@ function classifyHtml(body: string): string {
   return say("unrecognised page");
 }
 
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/**
+ * One way of asking VK for a token.
+ *
+ * A browser completes this flow in a single click, so the question is which
+ * property of a browser request `login.vk.ru/?act=grant_access` is checking
+ * for. Each strategy adds one candidate, and they run cheapest-first so the
+ * output names the minimum that works rather than a pile that happens to.
+ */
+interface Strategy {
+  label: string;
+  why: string;
+  /** Referer + Sec-Fetch-* + Upgrade-Insecure-Requests, as a navigation sends. */
+  browserHeaders?: boolean;
+  /** Echo the httoken cookie as a query param (double-submit CSRF pattern). */
+  sendHttoken?: boolean;
+  extraParams?: Record<string, string>;
+}
+
+const STRATEGIES: Strategy[] = [
+  {
+    label: "plain",
+    why: "what failed before — the baseline, so a fix is attributable",
+  },
+  {
+    label: "+ browser navigation headers",
+    why: "Referer/Sec-Fetch-*: a cross-site GET carrying cookies but no Referer " +
+      "is the classic shape of a request a CSRF check rejects",
+    browserHeaders: true,
+  },
+  {
+    label: "+ httoken echoed as a param",
+    why: "VK sets an httoken cookie; double-submit CSRF wants it repeated in " +
+      "the request, which is what a page-rendered form would do",
+    browserHeaders: true,
+    sendHttoken: true,
+  },
+  {
+    label: "+ display=page",
+    why: "the parameter the working browser approval carried, in case " +
+      "grant_access branches on presentation",
+    browserHeaders: true,
+    sendHttoken: true,
+    extraParams: { display: "page" },
+  },
+];
+
+interface Outcome {
+  token: string | null;
+  expiresIn: number | null;
+  errCode: string | null;
+  sawGrantAccess: boolean;
+  note: string;
+}
+
+async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promise<Outcome> {
+  let jar = jarIn;
+  const httoken = /(?:^|;\s*)httoken=([^;]+)/.exec(jarIn)?.[1] ?? "";
+  // Built by hand, NOT with URLSearchParams: that percent-encodes the comma to
+  // `scope=photos%2Cwall`, and the literal-comma form is the one observed to
+  // reach grant_access. Not worth risking VK's parser on a cosmetic change.
+  const extra = Object.entries(strategy.extraParams ?? {})
+    .map(([k, v]) => `&${k}=${v}`)
+    .join("");
+  let url =
+    `https://${HOST}/authorize?client_id=${APP_ID}&scope=${SCOPE}` +
+    `&redirect_uri=https://${HOST}/blank.html&response_type=token` +
+    `&v=${API_VERSION}${extra}`;
+  let referer = `https://${HOST}/`;
+  const out: Outcome = {
+    token: null, expiresIn: null, errCode: null, sawGrantAccess: false, note: "",
+  };
+
+  for (let hop = 1; hop <= 8; hop++) {
+    let target = url;
+    if (strategy.sendHttoken && httoken && /act=grant_access/.test(target) &&
+        !/[?&]httoken=/.test(target)) {
+      target += `&httoken=${encodeURIComponent(httoken)}`;
+    }
+
+    const headers: Record<string, string> = {
+      cookie: jar,
+      "user-agent": UA,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
+    };
+    if (strategy.browserHeaders) {
+      headers.referer = referer;
+      headers["sec-fetch-dest"] = "document";
+      headers["sec-fetch-mode"] = "navigate";
+      headers["sec-fetch-site"] = new URL(target).host === new URL(referer).host
+        ? "same-origin" : "cross-site";
+      headers["sec-fetch-user"] = "?1";
+      headers["upgrade-insecure-requests"] = "1";
+    }
+
+    const res: Response = await fetch(target, { redirect: "manual", headers });
+    jar = mergeSetCookie(jar, res.headers.getSetCookie?.() ?? []);
+    const location = res.headers.get("location");
+    const here = new URL(target);
+    console.log(`      [${hop}] ${res.status} ${here.host}${here.pathname}`);
+
+    if (location) {
+      const shown = location.replace(/access_token=[^&]+/, "access_token=<redacted>");
+      console.log(`          → ${verbose ? shown : shown.slice(0, 150)}`);
+      const frag = location.split("#")[1];
+      if (frag) {
+        const q = new URLSearchParams(frag);
+        const t = q.get("access_token");
+        if (t) {
+          out.token = t;
+          out.expiresIn = Number(q.get("expires_in") ?? "0");
+          return out;
+        }
+        if (q.get("error")) {
+          out.note = `${q.get("error")}: ${q.get("error_description") ?? ""}`;
+          return out;
+        }
+      }
+      if (/act=grant_access/.test(location)) out.sawGrantAccess = true;
+      const err = /[?&]err=(\d+)/.exec(location);
+      if (err) out.errCode = err[1];
+      referer = target;
+      url = new URL(location, target).toString();
+      continue;
+    }
+
+    const body = await readBody(res);
+    if (res.headers.get("content-type")?.includes("json")) {
+      out.note = body.slice(0, 200);
+      return out;
+    }
+    if (/\/blank\.html/.test(target)) {
+      out.note = "landed on blank.html with no token";
+      return out;
+    }
+    out.note = classifyHtml(body);
+    return out;
+  }
+  out.note = "redirect limit reached";
+  return out;
+}
+
 async function main(): Promise<void> {
+  const verbose = process.argv.includes("--verbose");
   const parsed = loadJar();
-  let jar = parsed.jar;
   const names = parsed.jar.split(";").map((c) => c.trim().split("=")[0]).filter(Boolean);
 
-  // Match the oauth host to the jar. A .vk.com jar sent to oauth.vk.ru is not
-  // attached at all, and VK then serves the login page — indistinguishable
-  // from a dead session unless you already suspect the domain.
   if (!HOST) {
     const com = parsed.domains.some((d) => d.endsWith("vk.com"));
     const ru = parsed.domains.some((d) => d.endsWith("vk.ru"));
@@ -278,149 +421,66 @@ async function main(): Promise<void> {
   }
 
   console.log(`VK token renewal probe — app ${APP_ID}, scope "${SCOPE}", via ${HOST}\n`);
-  console.log(`cookies: ${names.length} loaded from ${cookieFile()}`);
-  console.log(`         format: ${parsed.format}`);
-  if (parsed.domains.length) {
-    console.log(`         domains: ${parsed.domains.join(", ")}`);
-  }
-  console.log(`         ${names.join(", ")}`);
+  console.log(`cookies: ${names.length} loaded from ${cookieFile()}  (${parsed.format})`);
   if (!names.some((n) => /^remixsid/.test(n))) {
-    console.log(
-      "         WARNING: no remixsid — that is the session cookie. Either the\n" +
-        "         tab was logged out, or the export was filtered to one domain\n" +
-        "         and dropped the HttpOnly entries.",
-    );
-  }
-  if (parsed.domains.length && !parsed.domains.some((d) => /(^|\.)vk\.(ru|com)$/.test(d))) {
-    console.log(
-      `         WARNING: no vk.ru/vk.com cookies in this jar — exported from ` +
-        `the wrong site?`,
-    );
+    console.log("         WARNING: no remixsid — that is the session cookie.");
   }
   console.log();
 
-  const authorizeUrl =
-    `https://${HOST}/authorize?client_id=${APP_ID}&scope=${SCOPE}` +
-    `&redirect_uri=https://${HOST}/blank.html&response_type=token&v=${API_VERSION}`;
-  let url = authorizeUrl;
-
-  let token: string | null = null;
-  let expiresIn: number | null = null;
-  // Two signals that between them explain a chain that ends without a token.
-  let sawGrantAccess = false;
-  let errCode: string | null = null;
-
-  for (let hop = 1; hop <= 8; hop++) {
-    const res: Response = await fetch(url, {
-      redirect: "manual",
-      headers: {
-        cookie: jar,
-        "user-agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
-      },
-    });
-
-    jar = mergeSetCookie(jar, res.headers.getSetCookie?.() ?? []);
-    const location = res.headers.get("location");
-    const host = new URL(url).host;
-    console.log(`[${hop}] ${res.status} ${host}${new URL(url).pathname}`);
-
-    if (location) {
-      // The fragment never reaches a server, but it IS present in the Location
-      // header of the redirect that carries it — which is exactly how a
-      // non-browser client can read an implicit-flow token.
-      const shown = location.replace(/access_token=[^&]+/, "access_token=<redacted>");
-      console.log(`    → ${shown.slice(0, 160)}`);
-      const frag = location.split("#")[1];
-      if (frag) {
-        const p = new URLSearchParams(frag);
-        const t = p.get("access_token");
-        if (t) {
-          token = t;
-          expiresIn = Number(p.get("expires_in") ?? "0");
-          break;
-        }
-        const err = p.get("error");
-        if (err) {
-          console.log(`\nFAILED — ${err}: ${p.get("error_description") ?? ""}`);
-          process.exit(1);
-        }
-      }
-      // Reaching act=grant_access means the session WAS accepted and VK moved
-      // on to consent — the app simply has no OAuth-side grant yet. A Mini App
-      // approval given through VK Bridge is a separate record and does not
-      // count here.
-      if (/act=grant_access/.test(location)) sawGrantAccess = true;
-      const errMatch = /[?&]err=(\d+)/.exec(location);
-      if (errMatch) errCode = errMatch[1];
-      url = new URL(location, url).toString();
-      continue;
+  let winner: { strategy: Strategy; outcome: Outcome } | null = null;
+  let anyGrantAccess = false;
+  for (const strategy of STRATEGIES) {
+    console.log(`── ${strategy.label}`);
+    console.log(`   ${strategy.why}`);
+    const outcome = await walk(strategy, parsed.jar, verbose);
+    if (outcome.sawGrantAccess) anyGrantAccess = true;
+    if (outcome.token) {
+      console.log("      TOKEN ISSUED\n");
+      winner = { strategy, outcome };
+      break;
     }
-
-    const body = await readBody(res);
-    if (res.headers.get("content-type")?.includes("json")) {
-      console.log(`\nFAILED — VK answered ${res.status}: ${body.slice(0, 300)}`);
-      process.exit(1);
-    }
-    // blank.html is where VK dumps you after an error it already swallowed, so
-    // it is a terminus rather than a page worth classifying. The reason is in
-    // the redirects that led here.
-    if (/\/blank\.html/.test(url)) break;
-    console.log(`\nSTOPPED — ${classifyHtml(body)}`);
-    console.log(`\n(first 400 bytes)\n${body.replace(/\s+/g, " ").slice(0, 400)}`);
-    process.exit(1);
+    console.log(
+      `      no token${outcome.errCode ? ` — err=${outcome.errCode}` : ""}` +
+        `${outcome.note ? ` — ${outcome.note.split("\n")[0]}` : ""}\n`,
+    );
   }
 
-  if (!token) {
-    const meaning: Record<string, string> = {
-      "1": 'invalid_request — VK calls it a "strange request"',
-      "2": "Security Error — what VK returns when act=grant_access is reached " +
-        "without an interactive confirmation",
-      "3": "invalid_scope — standalone apps must use blank.html as redirect_uri",
-    };
-    if (errCode) {
-      console.log(`\nVK error err=${errCode}: ${meaning[errCode] ?? "unknown code"}`);
-    }
-    if (sawGrantAccess) {
+  if (!winner) {
+    // Which failure this is decides where to look next, so do not describe one
+    // as the other — the login case is a jar problem and the grant_access case
+    // is not.
+    if (anyGrantAccess) {
+      console.log("VERDICT: session accepted, but every strategy was refused at grant_access.");
       console.log(
-        "\nSTOPPED — CONSENT NOT YET GRANTED (and the session is FINE).\n\n" +
-          "The chain reached act=grant_access, which means VK accepted these\n" +
-          "cookies and identified you — the part that had to work, works. It\n" +
-          "then wanted a consent screen, and nothing here can click it.\n\n" +
-          "Approving through the Mini App does NOT satisfy this: a VK Bridge\n" +
-          "grant and an OAuth grant are separate records.\n\n" +
-          "Open this once, signed in as the community admin, and press\n" +
-          '"Разрешить":\n\n' +
-          `  ${authorizeUrl}&display=page\n\n` +
-          "You land on a blank.html whose address bar holds\n" +
-          "#access_token=… — that token is live now, so you can install it\n" +
-          "immediately and unbreak photo posting.\n\n" +
-          "Then re-run this probe. With the grant on record VK should skip\n" +
-          "consent and hand the token straight back, which is exactly what\n" +
-          "unattended renewal needs.",
+        "\nReaching grant_access means VK identified the session — this is not a\n" +
+          "cookie problem. It is refusing to issue a token to a non-interactive\n" +
+          "client, and none of the browser properties tested above is what it\n" +
+          "checks for.\n\n" +
+          "Re-run with `-- --verbose` to print the grant_access URL in full; a\n" +
+          "parameter truncated out of the log is the most likely missing piece.",
       );
-      process.exit(2);
+    } else {
+      console.log("VERDICT: the flow never reached grant_access.");
+      console.log(
+        "\nVK asked for credentials instead of identifying the session, so the\n" +
+          "jar is the problem — stale, exported from a logged-out tab, or scoped\n" +
+          "to the other domain. Re-export and try again.",
+      );
     }
-    console.log("\nFAILED — redirect chain ended without a token, and without " +
-      "reaching consent. See the hops above.");
-    process.exit(1);
+    process.exit(2);
   }
 
-  console.log("\nTOKEN ISSUED");
-  console.log(`    fingerprint: ${fingerprint(token)}  (length ${token.length})`);
+  const { token, expiresIn } = winner.outcome;
+  console.log(`VERDICT: unattended renewal works — via "${winner.strategy.label}".`);
+  console.log(`    fingerprint: ${fingerprint(token as string)}  (length ${(token as string).length})`);
   console.log(
     `    expires_in:  ${expiresIn} s` +
       (expiresIn ? ` = ${(expiresIn / 3600).toFixed(1)} h` : " — no expiry reported"),
   );
 
-  // A token that authorises is not yet a token that works: the whole reason
-  // this project exists is that photo uploads have their own gate.
-  process.stdout.write("\nvalidating against photos.getWallUploadServer … ");
+  process.stdout.write("\n    validating against photos.getWallUploadServer … ");
   try {
-    const api = new API({ token });
+    const api = new API({ token: token as string });
     const res = (await api.photos.getWallUploadServer({
       group_id: GROUP_ID,
     })) as unknown as { upload_url?: string };
@@ -428,17 +488,13 @@ async function main(): Promise<void> {
   } catch (e) {
     const err = e as { code?: number; message?: string };
     console.log(`FAILED — Code ${err?.code ?? "?"}: ${err?.message ?? String(e)}`);
-    console.log("\nThe session renews fine but the token cannot upload. That is a");
-    console.log("scope or IP problem, not a session problem — different fix.");
+    console.log("\nRenewal works but the token cannot upload — a scope or IP problem,");
+    console.log("not a session problem. Different fix.");
     process.exit(1);
   }
 
-  console.log("\nVERDICT: unattended renewal works from this host.");
-  if (REVEAL) {
-    console.log(`\naccess_token (treat as a password):\n${token}`);
-  } else {
-    console.log("\nRe-run with `-- --reveal` to print the token and install it.");
-  }
+  if (REVEAL) console.log(`\naccess_token (treat as a password):\n${token}`);
+  else console.log("\nRe-run with `-- --reveal` to print the token.");
 }
 
 main().catch((e) => {
