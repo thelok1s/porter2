@@ -32,10 +32,11 @@ const REVEAL = process.argv.includes("--reveal");
 const APP_ID = Number(process.env.VK_APP_ID ?? "") || 54703482;
 const SCOPE = "photos,wall";
 const API_VERSION = "5.199";
-// vk.ru and vk.com are the same service, but the session cookies are scoped to
-// whichever domain you exported them from. Use the matching oauth host or the
-// jar simply will not be sent.
-const HOST = (process.env.VK_OAUTH_HOST ?? "oauth.vk.ru").replace(/^https?:\/\//, "");
+// vk.ru and vk.com are the same service, but session cookies are scoped to
+// whichever domain you exported them from — send a .vk.com jar to oauth.vk.ru
+// and it is simply not attached, which looks identical to being logged out.
+// Chosen from the jar below when the export format carries domains.
+let HOST = (process.env.VK_OAUTH_HOST ?? "").replace(/^https?:\/\//, "");
 
 const parsedGroup = parseInt(process.env.VK_GROUP_ID ?? "");
 if (!Number.isFinite(parsedGroup) || parsedGroup === 0) {
@@ -44,31 +45,129 @@ if (!Number.isFinite(parsedGroup) || parsedGroup === 0) {
 }
 const GROUP_ID = Math.abs(parsedGroup);
 
-const cookieFile = path.resolve(process.env.VK_COOKIE_FILE ?? "./db/vkcookies.txt");
+function cookieFile(): string {
+  if (process.env.VK_COOKIE_FILE) return path.resolve(process.env.VK_COOKIE_FILE);
+  for (const candidate of ["./db/vkcookies.txt", "./db/vkcookies.json"]) {
+    const full = path.resolve(candidate);
+    if (fs.existsSync(full)) return full;
+  }
+  return path.resolve("./db/vkcookies.txt");
+}
 
-function loadCookies(): string {
-  let raw: string;
+interface Jar {
+  /** Ready to send as a `Cookie:` header. */
+  jar: string;
+  /** Which export format was recognised, for the log. */
+  format: string;
+  /** Cookie domains seen, when the format records them. Empty for a header string. */
+  domains: string[];
+}
+
+const HELP = `Create the jar from a logged-in VK tab. Any ONE of these works:
+
+  A. Cookie header (no extension needed)
+     Chrome -> open vk.ru -> DevTools -> Network -> click any vk.ru request
+     -> Request Headers -> right-click the \`Cookie:\` line -> Copy value
+     -> paste the whole line into the file.
+
+  B. Netscape cookies.txt
+     What "Get cookies.txt", curl and yt-dlp produce. Tab-separated, often
+     starting with "# Netscape HTTP Cookie File". Paste it in unchanged.
+
+  C. JSON
+     What Cookie-Editor and EditThisCookie produce: an array of
+     {"name": ..., "value": ...} objects. Paste it in unchanged.
+
+Export the WHOLE jar, not just remixsid: that cookie is HttpOnly (so
+\`document.cookie\` cannot see it) and VK validates several together.`;
+
+/**
+ * Accept whatever the user's export tool produced.
+ *
+ * Three formats are in circulation and they are trivial to confuse, so detect
+ * rather than demand. Getting this wrong reads as "logged out" — the same
+ * symptom as a genuinely dead session — which would send the diagnosis in
+ * completely the wrong direction.
+ */
+function parseJar(raw: string): Jar {
+  const text = raw.trim();
+  if (!text) {
+    console.error(`${cookieFile()} is empty.\n\n${HELP}`);
+    process.exit(1);
+  }
+
+  const pairs = new Map<string, string>();
+  const domains = new Set<string>();
+  let format: string;
+
+  if (text.startsWith("[") || text.startsWith("{")) {
+    format = "JSON";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      console.error(`${cookieFile()} looks like JSON but does not parse: ${String(e)}`);
+      process.exit(1);
+    }
+    // Cookie-Editor exports an array; some tools wrap it, and the design doc
+    // for the real renewer stores {"cookie": "<header>"}.
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : ((parsed as { cookies?: unknown[]; cookie?: string }).cookies ?? null);
+    if (!arr) {
+      const single = (parsed as { cookie?: string }).cookie;
+      if (typeof single === "string") return parseJar(single);
+      console.error(`${cookieFile()}: JSON has neither an array nor a "cookie" string.`);
+      process.exit(1);
+    }
+    for (const item of arr as { name?: string; value?: string; domain?: string }[]) {
+      if (!item?.name) continue;
+      pairs.set(item.name, item.value ?? "");
+      if (item.domain) domains.add(item.domain.replace(/^\./, ""));
+    }
+  } else if (/^[^\s#][^\n]*\t/m.test(text) || /^# Netscape/i.test(text)) {
+    format = "Netscape cookies.txt";
+    for (const line of text.split("\n")) {
+      // curl marks HttpOnly cookies with a #HttpOnly_ prefix on the domain.
+      // Those are the ones that matter here, so strip the marker rather than
+      // skipping the line as a comment — dropping them loses remixsid.
+      const cleaned = line.replace(/^#HttpOnly_/, "");
+      if (!cleaned.trim() || cleaned.startsWith("#")) continue;
+      const f = cleaned.split("\t").length >= 7 ? cleaned.split("\t") : cleaned.split(/\s+/);
+      if (f.length < 7) continue;
+      const [domain, , , , , name, ...rest] = f;
+      if (!name) continue;
+      pairs.set(name, rest.join("\t"));
+      domains.add(domain.replace(/^\./, ""));
+    }
+  } else {
+    format = "Cookie header";
+    for (const pair of text.replace(/^Cookie:\s*/i, "").replace(/\s*\n\s*/g, " ").split(";")) {
+      const [k, ...v] = pair.trim().split("=");
+      if (k) pairs.set(k, v.join("="));
+    }
+  }
+
+  if (pairs.size === 0) {
+    console.error(`${cookieFile()}: recognised ${format} but found no cookies.\n\n${HELP}`);
+    process.exit(1);
+  }
+
+  return {
+    jar: [...pairs].map(([k, v]) => `${k}=${v}`).join("; "),
+    format,
+    domains: [...domains],
+  };
+}
+
+function loadJar(): Jar {
   try {
-    raw = fs.readFileSync(cookieFile, "utf8");
-  } catch {
-    console.error(
-      `No cookie jar at ${cookieFile}.\n\n` +
-        "Create it from a logged-in VK tab:\n" +
-        "  Chrome → open vk.ru → DevTools → Network → click any vk.ru request\n" +
-        "  → Request Headers → right-click the `Cookie:` line → Copy value\n" +
-        "  → paste the WHOLE line into that file, one line, no quotes.\n\n" +
-        "Copying the Cookie header rather than picking out `remixsid` by hand is\n" +
-        "deliberate: the session cookie is HttpOnly (so `document.cookie` cannot\n" +
-        "see it) and VK checks several cookies together.",
-    );
+    return parseJar(fs.readFileSync(cookieFile(), "utf8"));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    console.error(`No cookie jar at ${cookieFile()}.\n\n${HELP}`);
     process.exit(1);
   }
-  const jar = raw.trim().replace(/^Cookie:\s*/i, "").replace(/\s*\n\s*/g, " ");
-  if (!jar) {
-    console.error(`${cookieFile} is empty.`);
-    process.exit(1);
-  }
-  return jar;
 }
 
 /** Merge Set-Cookie from a hop into the jar, so the chain stays authenticated. */
@@ -92,32 +191,113 @@ function mergeSetCookie(jar: string, setCookies: string[]): string {
 const fingerprint = (t: string): string =>
   crypto.createHash("sha256").update(t).digest("hex").slice(0, 12);
 
-/** Classify an HTML body VK serves instead of redirecting. */
+/**
+ * Decode a VK page.
+ *
+ * These pages are windows-1251 and VK declares that NOWHERE — no charset in
+ * Content-Type, no meta tag. `res.text()` assumes UTF-8 and returns mojibake,
+ * which silently disables every Cyrillic pattern below and makes a consent
+ * page or a security check read as a dead session: the exact distinction this
+ * probe exists to draw. Valid UTF-8 never produces U+FFFD, so its presence is
+ * a reliable tell to re-decode.
+ */
+async function readBody(res: Response): Promise<string> {
+  const buf = Buffer.from(await res.arrayBuffer());
+  const declared = /charset=["']?([\w-]+)/i.exec(
+    (res.headers.get("content-type") ?? "") + buf.subarray(0, 2048).toString("latin1"),
+  )?.[1];
+  if (declared) {
+    try {
+      return new TextDecoder(declared).decode(buf);
+    } catch {
+      /* unknown label — fall through to sniffing */
+    }
+  }
+  const utf8 = buf.toString("utf8");
+  if (!utf8.includes("\uFFFD")) return utf8;
+  try {
+    return new TextDecoder("windows-1251").decode(buf);
+  } catch {
+    return utf8;
+  }
+}
+
+/**
+ * Classify an HTML page VK serves instead of redirecting.
+ *
+ * Order and pattern choice are both load-bearing, and both were arrived at by
+ * measuring the real pages rather than by reasoning:
+ *
+ *   • A bare /captcha/ matched EVERY login page, because VK's oauth form always
+ *     carries a populated hidden `captcha_sid` whether or not a captcha is
+ *     actually demanded. It reported SECURITY CHECK — a false positive on the
+ *     one verdict that would abandon the whole approach. Only `captcha_img`,
+ *     the visible challenge, means a captcha is really being asked for.
+ *   • A real `<input type="password">` is the one dependable positive signal:
+ *     present on the login form, absent from consent and security pages.
+ *
+ * The decoded <title> is reported alongside the verdict so a wrong guess stays
+ * visible instead of authoritative.
+ */
 function classifyHtml(body: string): string {
-  if (/name=["']?(pass|password)/i.test(body) || /VK ID/i.test(body))
-    return "LOGIN PAGE — the session cookies are dead or were never valid here";
-  if (/(Разрешить|Allow|запрашивает доступ|requests access)/i.test(body))
-    return "CONSENT PAGE — session is alive, but the app is not pre-authorised " +
-      "for these scopes, so renewal cannot run unattended until it is approved once";
-  if (/(подтвер|confirm|security check|Проверка безопасности|captcha)/i.test(body))
-    return "SECURITY CHECK — VK wants re-validation, most likely because the " +
-      "request came from a different IP than the one that minted the session";
-  return "unrecognised HTML page (see the dump below)";
+  const title = /<title>([^<]*)<\/title>/i.exec(body)?.[1]?.trim() ?? "(no title)";
+  const say = (verdict: string): string => `${verdict}\n           VK titled the page: "${title}"`;
+
+  if (/(Разрешить|запрашивает доступ|запрашивает следующие|requests? access)/i.test(body))
+    return say(
+      "CONSENT PAGE — session is alive, the app just is not pre-authorised for " +
+        "these scopes. Approve once in a browser, then renewal runs unattended.",
+    );
+  if (/type=["']?password/i.test(body))
+    return say(
+      "LOGIN PAGE — VK did not accept the session and is asking for credentials. " +
+        "The jar is stale, from a logged-out tab, or scoped to the other domain " +
+        "(a .vk.com jar is never sent to oauth.vk.ru).",
+    );
+  if (/(Проверка безопасности|не робот|captcha_img|security check|Подтверждение входа)/i.test(body))
+    return say(
+      "SECURITY CHECK — VK wants re-validation, most likely because the request " +
+        "arrived from a different IP than the one that minted the session. " +
+        "This is the result that sinks the cookie-jar approach.",
+    );
+  return say("unrecognised page");
 }
 
 async function main(): Promise<void> {
-  console.log(`VK token renewal probe — app ${APP_ID}, scope "${SCOPE}", via ${HOST}\n`);
+  const parsed = loadJar();
+  let jar = parsed.jar;
+  const names = parsed.jar.split(";").map((c) => c.trim().split("=")[0]).filter(Boolean);
 
-  let jar = loadCookies();
-  const names = jar.split(";").map((c) => c.trim().split("=")[0]).filter(Boolean);
-  console.log(`cookies: ${names.length} loaded from ${cookieFile}`);
+  // Match the oauth host to the jar. A .vk.com jar sent to oauth.vk.ru is not
+  // attached at all, and VK then serves the login page — indistinguishable
+  // from a dead session unless you already suspect the domain.
+  if (!HOST) {
+    const com = parsed.domains.some((d) => d.endsWith("vk.com"));
+    const ru = parsed.domains.some((d) => d.endsWith("vk.ru"));
+    HOST = com && !ru ? "oauth.vk.com" : "oauth.vk.ru";
+  }
+
+  console.log(`VK token renewal probe — app ${APP_ID}, scope "${SCOPE}", via ${HOST}\n`);
+  console.log(`cookies: ${names.length} loaded from ${cookieFile()}`);
+  console.log(`         format: ${parsed.format}`);
+  if (parsed.domains.length) {
+    console.log(`         domains: ${parsed.domains.join(", ")}`);
+  }
   console.log(`         ${names.join(", ")}`);
-  console.log(
-    names.some((n) => /^remixsid/.test(n))
-      ? "         remixsid present\n"
-      : "         WARNING: no remixsid — this is the session cookie; the jar " +
-        "is probably from a logged-out tab\n",
-  );
+  if (!names.some((n) => /^remixsid/.test(n))) {
+    console.log(
+      "         WARNING: no remixsid — that is the session cookie. Either the\n" +
+        "         tab was logged out, or the export was filtered to one domain\n" +
+        "         and dropped the HttpOnly entries.",
+    );
+  }
+  if (parsed.domains.length && !parsed.domains.some((d) => /(^|\.)vk\.(ru|com)$/.test(d))) {
+    console.log(
+      `         WARNING: no vk.ru/vk.com cookies in this jar — exported from ` +
+        `the wrong site?`,
+    );
+  }
+  console.log();
 
   let url =
     `https://${HOST}/authorize?client_id=${APP_ID}&scope=${SCOPE}` +
@@ -169,7 +349,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const body = await res.text();
+    const body = await readBody(res);
     if (res.headers.get("content-type")?.includes("json")) {
       console.log(`\nFAILED — VK answered ${res.status}: ${body.slice(0, 300)}`);
       process.exit(1);
