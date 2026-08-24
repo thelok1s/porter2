@@ -121,6 +121,14 @@ export interface Config {
      * to act without the warning arriving so early it becomes background noise.
      */
     warnBeforeHours?: number;
+    /**
+     * Start trying unattended renewal once fewer than this many hours remain
+     * (or, for tokens with no reported expiry, once they are this old).
+     * Default 18 — about three quarters through the measured 24 h life, so
+     * the exchange runs while the outgoing token is still valid; the web_token
+     * route has only ever been observed accepting a live token.
+     */
+    renewAheadHours?: number;
   };
 
   health?: {

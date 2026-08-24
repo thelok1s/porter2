@@ -74,6 +74,11 @@ const PorterConfig: Config = {
     watch: true,
     intervalMinutes: 30,
     warnBeforeHours: 6,
+    // Renew proactively at ≤18 h remaining (~75 % of the measured life), so
+    // the web_token exchange runs while the outgoing token still works.
+    // Needs a browser-session jar at db/vkcookies.txt (see .env.example);
+    // without one, renewal reports "no-jar" and alerting takes over as before.
+    renewAheadHours: 18,
   },
 
   // Operator status readout. Off by default — it reports on live credentials

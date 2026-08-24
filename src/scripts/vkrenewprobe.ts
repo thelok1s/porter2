@@ -1,30 +1,32 @@
 import "dotenv/config";
 import fs from "fs";
-import path from "path";
 import crypto from "crypto";
 import { API } from "vk-io";
 
+import { cookieJarPath, loadCookieJar } from "../lib/vkcookies";
+import {
+  parseWebTokenEnvelope,
+  mergeSetCookies,
+  WEB_CLIENT_APP_ID,
+} from "../lib/vkrenew";
+
 /**
- * THROWAWAY VALIDATION PROBE — not part of the runtime.
+ * Diagnostic probe for VK user-token renewal.
  *
- * Answers one question before any renewal engine gets written: will VK hand
- * this host a fresh user token when presented with an exported browser
- * session, or will it demand re-validation because the request arrives from
- * porter's IP instead of the laptop the cookies were minted on?
- *
- * Background. VK Mini App / implicit-flow user tokens last ~24 h and there is
- * no refresh token. The `offline` scope, which used to make them permanent,
- * has been removed: oauth.vk.ru answers
- *   401 {"error":"invalid_request","error_description":"invalid scope"}
- * for `offline` in any combination, while accepting a nonsense scope with 200.
- * So the only unattended route left is to replay the legacy implicit flow with
- * a logged-in session, which is what this measures.
- *
- * Writes nothing to VK. The authorize call issues a token (that is the point);
- * the validation call returns an upload URL and creates no photo and no post.
+ * The runtime renewer (src/lib/vkrenew.ts) replays `POST login.vk.ru/
+ * ?act=web_token` — the exchange VK's own web client makes for an approved
+ * Mini App. This probe runs the SAME route standalone: it never touches
+ * db/vkuser.json, so it can be pointed at a freshly exported cookie jar to
+ * answer "would automatic renewal succeed right now?" before anything is at
+ * stake. It also still carries the older OAuth consent-chain strategies below,
+ * kept because they are the best map of WHY when web_token refuses (jar stale,
+ * security check, refused consent).
  *
  *   npm run vkrenewprobe            # verdict only, token never printed
  *   npm run vkrenewprobe -- --reveal  # also print the token, to install it
+ *
+ * Writes nothing to VK beyond the exchange itself: the validation call returns
+ * an upload URL and creates no photo and no post.
  */
 
 const REVEAL = process.argv.includes("--reveal");
@@ -33,7 +35,7 @@ const APP_ID = Number(process.env.VK_APP_ID ?? "") || 54703482;
 const SCOPE = "photos,wall";
 const API_VERSION = "5.199";
 // vk.ru and vk.com are the same service, but session cookies are scoped to
-// whichever domain you exported them from — send a .vk.com jar to oauth.vk.ru
+// whichever domain you exported them from — send a .vk.com jar to login.vk.ru
 // and it is simply not attached, which looks identical to being logged out.
 // Chosen from the jar below when the export format carries domains.
 let HOST = (process.env.VK_OAUTH_HOST ?? "").replace(/^https?:\/\//, "");
@@ -45,25 +47,8 @@ if (!Number.isFinite(parsedGroup) || parsedGroup === 0) {
 }
 const GROUP_ID = Math.abs(parsedGroup);
 
-function cookieFile(): string {
-  if (process.env.VK_COOKIE_FILE) return path.resolve(process.env.VK_COOKIE_FILE);
-  for (const candidate of ["./db/vkcookies.txt", "./db/vkcookies.json"]) {
-    const full = path.resolve(candidate);
-    if (fs.existsSync(full)) return full;
-  }
-  return path.resolve("./db/vkcookies.txt");
-}
-
-interface Jar {
-  /** Ready to send as a `Cookie:` header. */
-  jar: string;
-  /** Which export format was recognised, for the log. */
-  format: string;
-  /** Cookie domains seen, when the format records them. Empty for a header string. */
-  domains: string[];
-}
-
-const HELP = `Create the jar from a logged-in VK tab. Any ONE of these works:
+const HELP = `Create the jar from a logged-in VK tab, saved at db/vkcookies.txt
+(override with VK_COOKIE_FILE). Any ONE of these formats works:
 
   A. Cookie header (no extension needed)
      Chrome -> open vk.ru -> DevTools -> Network -> click any vk.ru request
@@ -81,115 +66,25 @@ const HELP = `Create the jar from a logged-in VK tab. Any ONE of these works:
 Export the WHOLE jar, not just remixsid: that cookie is HttpOnly (so
 \`document.cookie\` cannot see it) and VK validates several together.`;
 
-/**
- * Accept whatever the user's export tool produced.
- *
- * Three formats are in circulation and they are trivial to confuse, so detect
- * rather than demand. Getting this wrong reads as "logged out" — the same
- * symptom as a genuinely dead session — which would send the diagnosis in
- * completely the wrong direction.
- */
-function parseJar(raw: string): Jar {
-  const text = raw.trim();
-  if (!text) {
-    console.error(`${cookieFile()} is empty.\n\n${HELP}`);
-    process.exit(1);
-  }
-
-  const pairs = new Map<string, string>();
-  const domains = new Set<string>();
-  let format: string;
-
-  if (text.startsWith("[") || text.startsWith("{")) {
-    format = "JSON";
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      console.error(`${cookieFile()} looks like JSON but does not parse: ${String(e)}`);
-      process.exit(1);
-    }
-    // Cookie-Editor exports an array; some tools wrap it, and the design doc
-    // for the real renewer stores {"cookie": "<header>"}.
-    const arr = Array.isArray(parsed)
-      ? parsed
-      : ((parsed as { cookies?: unknown[]; cookie?: string }).cookies ?? null);
-    if (!arr) {
-      const single = (parsed as { cookie?: string }).cookie;
-      if (typeof single === "string") return parseJar(single);
-      console.error(`${cookieFile()}: JSON has neither an array nor a "cookie" string.`);
-      process.exit(1);
-    }
-    for (const item of arr as { name?: string; value?: string; domain?: string }[]) {
-      if (!item?.name) continue;
-      pairs.set(item.name, item.value ?? "");
-      if (item.domain) domains.add(item.domain.replace(/^\./, ""));
-    }
-  } else if (/^[^\s#][^\n]*\t/m.test(text) || /^# Netscape/i.test(text)) {
-    format = "Netscape cookies.txt";
-    for (const line of text.split("\n")) {
-      // curl marks HttpOnly cookies with a #HttpOnly_ prefix on the domain.
-      // Those are the ones that matter here, so strip the marker rather than
-      // skipping the line as a comment — dropping them loses remixsid.
-      const cleaned = line.replace(/^#HttpOnly_/, "");
-      if (!cleaned.trim() || cleaned.startsWith("#")) continue;
-      const f = cleaned.split("\t").length >= 7 ? cleaned.split("\t") : cleaned.split(/\s+/);
-      if (f.length < 7) continue;
-      const [domain, , , , , name, ...rest] = f;
-      if (!name) continue;
-      pairs.set(name, rest.join("\t"));
-      domains.add(domain.replace(/^\./, ""));
-    }
-  } else {
-    format = "Cookie header";
-    for (const pair of text.replace(/^Cookie:\s*/i, "").replace(/\s*\n\s*/g, " ").split(";")) {
-      const [k, ...v] = pair.trim().split("=");
-      if (k) pairs.set(k, v.join("="));
-    }
-  }
-
-  if (pairs.size === 0) {
-    console.error(`${cookieFile()}: recognised ${format} but found no cookies.\n\n${HELP}`);
-    process.exit(1);
-  }
-
-  return {
-    jar: [...pairs].map(([k, v]) => `${k}=${v}`).join("; "),
-    format,
-    domains: [...domains],
-  };
-}
-
-function loadJar(): Jar {
-  try {
-    return parseJar(fs.readFileSync(cookieFile(), "utf8"));
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    console.error(`No cookie jar at ${cookieFile()}.\n\n${HELP}`);
-    process.exit(1);
-  }
-}
-
-/** Merge Set-Cookie from a hop into the jar, so the chain stays authenticated. */
-function mergeSetCookie(jar: string, setCookies: string[]): string {
-  const map = new Map<string, string>();
-  for (const pair of jar.split(";")) {
-    const [k, ...v] = pair.trim().split("=");
-    if (k) map.set(k, v.join("="));
-  }
-  for (const sc of setCookies) {
-    const [pair] = sc.split(";");
-    const [k, ...v] = pair.trim().split("=");
-    if (!k) continue;
-    const value = v.join("=");
-    if (value === "DELETED" || /expires=Thu, 01 Jan 1970/i.test(sc)) map.delete(k);
-    else map.set(k, value);
-  }
-  return [...map].map(([k, v]) => `${k}=${v}`).join("; ");
-}
-
 const fingerprint = (t: string): string =>
   crypto.createHash("sha256").update(t).digest("hex").slice(0, 12);
+
+/** Load through the shared parser, so probe and runtime can never disagree. */
+function loadJar() {
+  const file = cookieJarPath();
+  try {
+    const parsed = loadCookieJar(file);
+    if (parsed) return parsed;
+  } catch (e) {
+    console.error(`${file} could not be read: ${String(e)}\n\n${HELP}`);
+    process.exit(1);
+  }
+  console.error(
+    `${fs.existsSync(file) ? `${file}: recognised no cookies in it` : `No cookie jar at ${file}`}.` +
+      `\n\n${HELP}`,
+  );
+  process.exit(1);
+}
 
 /**
  * Decode a VK page.
@@ -214,7 +109,7 @@ async function readBody(res: Response): Promise<string> {
     }
   }
   const utf8 = buf.toString("utf8");
-  if (!utf8.includes("\uFFFD")) return utf8;
+  if (!utf8.includes("�")) return utf8;
   try {
     return new TextDecoder("windows-1251").decode(buf);
   } catch {
@@ -246,19 +141,20 @@ function classifyHtml(body: string): string {
   if (/(Разрешить|запрашивает доступ|запрашивает следующие|requests? access)/i.test(body))
     return say(
       "CONSENT PAGE — session is alive, the app just is not pre-authorised for " +
-        "these scopes. Approve once in a browser, then renewal runs unattended.",
+        "these scopes. Approve once in a browser; that grant is exactly what " +
+        "lets act=web_token mint silently afterwards.",
     );
   if (/type=["']?password/i.test(body))
     return say(
       "LOGIN PAGE — VK did not accept the session and is asking for credentials. " +
         "The jar is stale, from a logged-out tab, or scoped to the other domain " +
-        "(a .vk.com jar is never sent to oauth.vk.ru).",
+        "(a .vk.com jar is never sent to login.vk.ru).",
     );
   if (/(Проверка безопасности|не робот|captcha_img|security check|Подтверждение входа)/i.test(body))
     return say(
       "SECURITY CHECK — VK wants re-validation, most likely because the request " +
         "arrived from a different IP than the one that minted the session. " +
-        "This is the result that sinks the cookie-jar approach.",
+        "Re-export the cookies from THIS network.",
     );
   return say("unrecognised page");
 }
@@ -267,29 +163,134 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+interface Outcome {
+  token: string | null;
+  /** Seconds the issuer expects this token to live; null when unreported. */
+  expiresIn: number | null;
+  errCode: string | null;
+  sawGrantAccess: boolean;
+  note: string;
+}
+
+const emptyOutcome = (): Outcome => ({
+  token: null, expiresIn: null, errCode: null, sawGrantAccess: false, note: "",
+});
+
 /**
- * One way of asking VK for a token.
+ * The production route, exercised standalone.
  *
- * A browser completes this flow in a single click, so the question is which
- * property of a browser request `login.vk.ru/?act=grant_access` is checking
- * for. Each strategy adds one candidate, and they run cheapest-first so the
- * output names the minimum that works rather than a pile that happens to.
+ * Contract (captured from VK's own web client, see src/lib/vkrenew.ts):
+ * POST form `version=1&app_id&access_token=<held token>` to
+ * login.<site>/?act=web_token with Origin https://vk.ru and the session jar.
+ * Measured gates: vk.com or an app origin answers "wrong origin"; GET without
+ * a body answers "unauthorized".
+ *
+ * Both app ids are tried — OUR Mini App first, then the id VK's web client
+ * uses for itself (what the original capture carried) — because which of them
+ * this endpoint accepts per app is exactly the open question this probe
+ * settles before the runtime ever depends on it.
+ */
+async function tryWebToken(jarIn: string, site: string): Promise<Outcome[]> {
+  const outcomes: Outcome[] = [];
+  let jar = jarIn;
+
+  for (const appId of [APP_ID, WEB_CLIENT_APP_ID]) {
+    const out = emptyOutcome();
+    console.log(`      POST login.${site}/?act=web_token   app ${appId}`);
+
+    try {
+      const res = await fetch(`https://login.${site}/?act=web_token`, {
+        method: "POST",
+        headers: {
+          cookie: jar,
+          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          origin: `https://${site}`,
+          referer: `https://${site}/`,
+          accept: "application/json, text/plain, */*",
+          "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-site",
+          "user-agent": UA,
+        },
+        body: new URLSearchParams({
+          version: "1",
+          app_id: String(appId),
+          access_token: (await getHeldToken()) ?? "",
+        }).toString(),
+      });
+      jar = mergeSetCookies(jar, res.headers.getSetCookie?.() ?? []);
+
+      const text = await readBody(res);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        out.note = `non-JSON answer (${res.status}): ${text.replace(/\s+/g, " ").slice(0, 160)}`;
+        outcomes.push(out);
+        continue;
+      }
+
+      const grant = parseWebTokenEnvelope(parsed);
+      if (grant) {
+        out.token = grant.token;
+        out.expiresIn = grant.secondsRemaining;
+      } else {
+        // Echo the envelope verbatim, minus credentials: undocumented errors
+        // are the only documentation this endpoint has.
+        out.note = JSON.stringify(parsed)
+          .replace(/"access_token":"[^"]*"/g, '"access_token":"<redacted>"')
+          .replace(/"logout_hash":"[^"]*"/g, '"logout_hash":"<redacted>"')
+          .slice(0, 240);
+      }
+    } catch (e) {
+      out.note = String(e).slice(0, 160);
+    }
+    outcomes.push(out);
+
+    // First success wins; no point asking again under the other app id.
+    if (out.token) break;
+  }
+  return outcomes;
+}
+
+/**
+ * The token the runtime currently holds — the value the exchange consumes.
+ *
+ * Read straight from the sources rather than importing @/lib/vkuser: the probe
+ * must be able to run against a DIFFERENT jar than production without dragging
+ * in the store's precedence rules, and must never write anything it loads.
+ */
+async function getHeldToken(): Promise<string | null> {
+  try {
+    const stored = JSON.parse(fs.readFileSync("./db/vkuser.json", "utf8"));
+    if (typeof stored?.token === "string" && stored.token) return stored.token;
+  } catch {
+    /* fall through to env */
+  }
+  const env = (process.env.VK_USER_TOKEN ?? "").trim();
+  return env || null;
+}
+
+/**
+ * One way of asking the legacy OAuth chain for a token — kept as DIAGNOSTICS.
+ *
+ * A browser completes this flow in a single click, so each strategy adds one
+ * candidate property a CSRF-style check might want. None survived measurement
+ * (every one was refused at grant_access), but walking them still separates a
+ * dead jar (never reaches grant_access) from a refusal (reaches it), which is
+ * the distinction that decides whether re-exporting cookies can help.
  */
 interface Strategy {
   label: string;
   why: string;
-  /** Referer + Sec-Fetch-* + Upgrade-Insecure-Requests, as a navigation sends. */
   browserHeaders?: boolean;
-  /** Echo the httoken cookie as a query param (double-submit CSRF pattern). */
   sendHttoken?: boolean;
   extraParams?: Record<string, string>;
 }
 
 const STRATEGIES: Strategy[] = [
-  {
-    label: "plain",
-    why: "what failed before — the baseline, so a fix is attributable",
-  },
+  { label: "plain", why: "baseline, so any change is attributable" },
   {
     label: "+ browser navigation headers",
     why: "Referer/Sec-Fetch-*: a cross-site GET carrying cookies but no Referer " +
@@ -299,27 +300,18 @@ const STRATEGIES: Strategy[] = [
   {
     label: "+ httoken echoed as a param",
     why: "VK sets an httoken cookie; double-submit CSRF wants it repeated in " +
-      "the request, which is what a page-rendered form would do",
+      "the request",
     browserHeaders: true,
     sendHttoken: true,
   },
   {
     label: "+ display=page",
-    why: "the parameter the working browser approval carried, in case " +
-      "grant_access branches on presentation",
+    why: "the parameter the working browser approval carried",
     browserHeaders: true,
     sendHttoken: true,
     extraParams: { display: "page" },
   },
 ];
-
-interface Outcome {
-  token: string | null;
-  expiresIn: number | null;
-  errCode: string | null;
-  sawGrantAccess: boolean;
-  note: string;
-}
 
 async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promise<Outcome> {
   let jar = jarIn;
@@ -335,9 +327,7 @@ async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promis
     `&redirect_uri=https://${HOST}/blank.html&response_type=token` +
     `&v=${API_VERSION}${extra}`;
   let referer = `https://${HOST}/`;
-  const out: Outcome = {
-    token: null, expiresIn: null, errCode: null, sawGrantAccess: false, note: "",
-  };
+  const out = emptyOutcome();
 
   for (let hop = 1; hop <= 8; hop++) {
     let target = url;
@@ -363,7 +353,7 @@ async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promis
     }
 
     const res: Response = await fetch(target, { redirect: "manual", headers });
-    jar = mergeSetCookie(jar, res.headers.getSetCookie?.() ?? []);
+    jar = mergeSetCookies(jar, res.headers.getSetCookie?.() ?? []);
     const location = res.headers.get("location");
     const here = new URL(target);
     console.log(`      [${hop}] ${res.status} ${here.host}${here.pathname}`);
@@ -377,7 +367,7 @@ async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promis
         const t = q.get("access_token");
         if (t) {
           out.token = t;
-          out.expiresIn = Number(q.get("expires_in") ?? "0");
+          out.expiresIn = Number(q.get("expires_in") ?? "0") || null;
           return out;
         }
         if (q.get("error")) {
@@ -409,87 +399,10 @@ async function walk(strategy: Strategy, jarIn: string, verbose: boolean): Promis
   return out;
 }
 
-/**
- * Recursively find an access token in a response of unknown shape.
- *
- * `act=web_token` is undocumented, so its success envelope is whatever VK
- * happens to send. Searching for the key beats hardcoding a path that moves.
- */
-function findToken(value: unknown): { token?: string; expires?: number } {
-  const found: { token?: string; expires?: number } = {};
-  const visit = (v: unknown): void => {
-    if (!v || typeof v !== "object") return;
-    for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
-      if (k === "access_token" && typeof child === "string") found.token = child;
-      else if ((k === "expires" || k === "expires_in") && typeof child === "number")
-        found.expires = child;
-      else visit(child);
-    }
-  };
-  visit(value);
-  return found;
-}
-
-/**
- * The call VK's web client makes to implement VKWebAppGetAuthToken.
- *
- * Much better suited to unattended use than replaying the OAuth consent chain:
- * one request, a JSON answer, and no grant_access step to be refused at. It is
- * why re-opening an already-approved Mini App hands back a token instantly.
- *
- * Two gates, measured against the live endpoint. Origin must be https://vk.ru
- * (https://vk.com and the app's own origin both answer "wrong origin"), and
- * then the web session decides — with no cookies it answers "unauthorized",
- * which is a statement about the JAR, not about the endpoint.
- */
-async function tryWebToken(jar: string, site: string): Promise<Outcome> {
-  const out: Outcome = {
-    token: null, expiresIn: null, errCode: null, sawGrantAccess: false, note: "",
-  };
-  console.log(`      GET login.${site}/?act=web_token`);
-
-  const res = await fetch(
-    `https://login.${site}/?act=web_token&app_id=${APP_ID}&scope=${SCOPE}`,
-    {
-      headers: {
-        cookie: jar,
-        origin: `https://${site}`,
-        referer: `https://${site}/`,
-        "user-agent": UA,
-        accept: "application/json, text/plain, */*",
-        "accept-language": "ru-RU,ru;q=0.9,en;q=0.8",
-      },
-    },
-  );
-
-  const text = await readBody(res);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    out.note = `non-JSON answer (${res.status}): ${text.replace(/\s+/g, " ").slice(0, 160)}`;
-    return out;
-  }
-
-  const { token, expires } = findToken(parsed);
-  if (token) {
-    out.token = token;
-    out.expiresIn = expires ?? null;
-    return out;
-  }
-
-  // Echo the envelope verbatim, minus any token. The shape is undocumented, so
-  // its error strings are the only documentation that exists.
-  out.note = JSON.stringify(parsed)
-    .replace(/"access_token":"[^"]*"/, '"access_token":"<redacted>"')
-    .slice(0, 240);
-  return out;
-}
-
 async function main(): Promise<void> {
   const verbose = process.argv.includes("--verbose");
   const parsed = loadJar();
-  const names = parsed.jar.split(";").map((c) => c.trim().split("=")[0]).filter(Boolean);
+  const names = parsed.names;
 
   if (!HOST) {
     const com = parsed.domains.some((d) => d.endsWith("vk.com"));
@@ -497,8 +410,8 @@ async function main(): Promise<void> {
     HOST = com && !ru ? "oauth.vk.com" : "oauth.vk.ru";
   }
 
-  console.log(`VK token renewal probe — app ${APP_ID}, scope "${SCOPE}", via ${HOST}\n`);
-  console.log(`cookies: ${names.length} loaded from ${cookieFile()}  (${parsed.format})`);
+  console.log(`VK token renewal probe — app ${APP_ID} (+${WEB_CLIENT_APP_ID} fallback), scope "${SCOPE}"\n`);
+  console.log(`cookies: ${names.length} loaded from ${cookieJarPath()}  (${parsed.format})`);
   console.log(`         ${names.join(", ")}`);
   // Which cookies are present is the first thing to check when two endpoints
   // disagree about the same jar, so keep listing them.
@@ -513,17 +426,31 @@ async function main(): Promise<void> {
   console.log();
 
   const site = HOST.replace(/^oauth\./, "");
-
-  // Cheapest and cleanest route first: one JSON call, no consent chain.
-  console.log("── web_token (what VKWebAppGetAuthToken calls underneath)");
-  console.log("   one JSON request; no grant_access step to be refused at");
-  const web = await tryWebToken(parsed.jar, site);
-  if (web.token) {
-    await report({ label: "web_token" } as Strategy, web);
-    return;
+  const held = await getHeldToken();
+  if (!held) {
+    console.error(
+      "No held token found (db/vkuser.json empty/unreadable, VK_USER_TOKEN unset)\n" +
+        "— the web_token exchange consumes the CURRENT token, so there is\n" +
+        "nothing to renew. Mint one in the Mini App first.",
+    );
+    process.exit(1);
   }
-  console.log(`      no token — ${web.note}\n`);
-  if (/unauthorized/i.test(web.note)) {
+
+  console.log("── web_token (the production renewal route)");
+  console.log("   POST form version/app_id/access_token; no consent step involved");
+  const attempts = await tryWebToken(parsed.header, site);
+  let sawUnauthorized = false;
+  for (let i = 0; i < attempts.length; i++) {
+    const out = attempts[i];
+    const appId = [APP_ID, WEB_CLIENT_APP_ID][Math.min(i, 1)];
+    if (out.token) {
+      await report(`web_token (app ${appId})`, out);
+      return;
+    }
+    console.log(`      no token — ${out.note}\n`);
+    if (/unauthorized/i.test(out.note)) sawUnauthorized = true;
+  }
+  if (sawUnauthorized) {
     console.log(
       '   NOTE: "unauthorized" here is about the JAR, not the endpoint. The\n' +
         "   origin check passed and VK simply does not recognise this session,\n" +
@@ -534,9 +461,9 @@ async function main(): Promise<void> {
   let winner: { strategy: Strategy; outcome: Outcome } | null = null;
   let anyGrantAccess = false;
   for (const strategy of STRATEGIES) {
-    console.log(`── ${strategy.label}`);
+    console.log(`── legacy chain: ${strategy.label} (diagnostics)`);
     console.log(`   ${strategy.why}`);
-    const outcome = await walk(strategy, parsed.jar, verbose);
+    const outcome = await walk(strategy, parsed.header, verbose);
     if (outcome.sawGrantAccess) anyGrantAccess = true;
     if (outcome.token) {
       console.log("      TOKEN ISSUED\n");
@@ -556,12 +483,9 @@ async function main(): Promise<void> {
     if (anyGrantAccess) {
       console.log("VERDICT: session accepted, but every strategy was refused at grant_access.");
       console.log(
-        "\nReaching grant_access means VK identified the session — this is not a\n" +
-          "cookie problem. It is refusing to issue a token to a non-interactive\n" +
-          "client, and none of the browser properties tested above is what it\n" +
-          "checks for.\n\n" +
-          "Re-run with `-- --verbose` to print the grant_access URL in full; a\n" +
-          "parameter truncated out of the log is the most likely missing piece.",
+        "\nThe legacy chain remains closed to scripts — expected; web_token above\n" +
+          "is the production route. Re-run with `-- --verbose` to print the\n" +
+          "grant_access URLs in full if you are mapping what changed.",
       );
     } else {
       console.log("VERDICT: the flow never reached grant_access.");
@@ -574,19 +498,21 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  await report(winner.strategy, winner.outcome);
+  await report(winner.strategy.label, winner.outcome);
 }
 
-/** Shared success path, so both routes report identically. */
-async function report(strategy: Strategy, outcome: Outcome): Promise<void> {
+/** Shared success path, so every route reports identically. */
+async function report(routeLabel: string, outcome: Outcome): Promise<void> {
   const token = outcome.token as string;
   const expiresIn = outcome.expiresIn;
-  console.log(`VERDICT: unattended renewal works — via "${strategy.label}".`);
+  console.log(`VERDICT: unattended renewal works — via "${routeLabel}".`);
   console.log(`    fingerprint: ${fingerprint(token)}  (length ${token.length})`);
-  console.log(
-    `    expires_in:  ${expiresIn ?? "not reported"}` +
-      (expiresIn ? ` s = ${(expiresIn / 3600).toFixed(1)} h` : ""),
-  );
+  if (expiresIn !== null) {
+    const eta = new Date(Date.now() + expiresIn * 1000).toISOString();
+    console.log(`    lifetime:    ${expiresIn} s = ${(expiresIn / 3600).toFixed(1)} h (until ~${eta})`);
+  } else {
+    console.log("    lifetime:    not reported");
+  }
 
   process.stdout.write("\n    validating against photos.getWallUploadServer … ");
   try {
@@ -603,6 +529,10 @@ async function report(strategy: Strategy, outcome: Outcome): Promise<void> {
     process.exit(1);
   }
 
+  console.log(
+    "\nThe runtime performs this exact exchange by itself from db/vkcookies.txt;",
+    "\nthis run installed nothing.",
+  );
   if (REVEAL) console.log(`\naccess_token (treat as a password):\n${token}`);
   else console.log("\nRe-run with `-- --reveal` to print the token.");
 }
