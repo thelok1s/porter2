@@ -66,10 +66,14 @@ db/vkcookies.txt (override with VK_COOKIE_FILE). Mints come from VK's
 web-client app id and last only ~15 min; the watchdog renews on that cadence
 by itself. Any ONE of these formats works:
 
-  A. Cookie header (no extension needed)
-     Chrome -> open vk.ru -> DevTools -> Network -> click any vk.ru request
-     -> Request Headers -> right-click the \`Cookie:\` line -> Copy value
-     -> paste the whole line into the file.
+  A. Cookie header (no extension needed) — BEST choice
+     Chrome -> open vk.ru -> DevTools -> Network -> click a request to
+     login.vk.ru (NOT just vk.ru!) -> Request Headers -> right-click the
+     \`Cookie:\` line -> Copy value -> paste into the file.
+     Why login.vk.ru: its Cookie header carries \`httoken\`, the login-domain
+     session cookie that vk.ru's own Application->Cookies view never shows —
+     measured 2026-08-26 as the difference between "unauthorized" and a
+     working mint.
 
   B. Netscape cookies.txt
      What "Get cookies.txt", curl and yt-dlp produce. Tab-separated, often
@@ -84,12 +88,12 @@ by itself. Any ONE of these formats works:
      separated columns (name, value, domain, path, expiry, ...). Paste in
      unchanged — and select the WHOLE list, not just the rows in view.
 
-Export the WHOLE jar from the SAME tab that talks to vk.ru. \`remixsid\` must
-be there, plus at least ONE token-carrier cookie — sessions keep their API
-token in \`p\`/\`sua\` (older) or \`remixnsid\`/\`remixnttpid\` (newer).
-Without any carrier, web_token answers "unauthorized" and there is nothing to
-harvest either. HttpOnly cookies are part of the jar; an export method that
-cannot see them is the wrong method.`;
+\`remixsid\` AND \`httoken\` must be in the jar — the latter rides only
+login.vk.ru traffic, hence format A. Carrier cookies (\`p\`/\`sua\` older,
+\`remixnsid\`/\`remixnttpid\` newer) matter only for the harvest fallback:
+the 2026-08-26 working jar had no p/sua and still minted. HttpOnly cookies
+are part of the jar; an export method that cannot see them is the wrong
+method.`;
 
 const fingerprint = (t: string): string =>
   crypto.createHash("sha256").update(t).digest("hex").slice(0, 12);
@@ -193,10 +197,8 @@ async function main(): Promise<void> {
     if (carriers.length === 0) {
       console.log(
         `         no token-carrier cookie (${JAR_TOKEN_CARRIERS.join(", ")}).\n` +
-          "         The session keeps its API token in one of these — older\n" +
-          "         sessions in p/sua, newer exports in remixnsid/remixnttpid.\n" +
-          '         Without any, web_token answers "unauthorized" and the\n' +
-          "         harvest fallback has nothing to try.",
+          "         The exchange itself works without them (measured), but\n" +
+          "         the harvest fallback will have nothing to try.",
       );
     }
     console.log("         Fix: re-export the COMPLETE jar (see below).");

@@ -21,11 +21,14 @@ import { loadCookieJar, saveCookieJar } from "@/lib/vkcookies";
  *        "expires":<unix seconds>,"user_id":…,"logout_hash":"…"}}
  *
  * The decisive property: authentication is the COOKIE JAR, not the body. The
- * working capture carried no access_token at all — the session cookies (most
- * tellingly `p`, itself a vk1.a token, alongside remixsid and httoken) are
- * what authorizes the mint. Both body shapes are therefore tried; a partial
- * jar that lacks the session-token cookies is refused with
- * {"error_info":"unauthorized"}, which no body shape can talk around.
+ * working capture carried no access_token at all. Which cookies decide is now
+ * measured (2026-08-26): the login-DOMAIN session token `httoken` — invisible
+ * to a vk.ru-only export, since it is set by and sent to login.vk.ru only —
+ * is what separates {"error_info":"unauthorized"} from an authenticated
+ * request, while the token-carrier cookies proved unnecessary (the working
+ * jar had no `p`/`sua`). Both body shapes are tried anyway; a jar missing the
+ * session cookies is refused with {"error_info":"unauthorized"}, which no
+ * body shape can talk around.
  *
  * Fallback: a COMPLETE jar contains usable API tokens outright — `p` is one,
  * and `sua` embeds another between ^ separators. Those are harvested and put
@@ -161,14 +164,22 @@ export function parseWebTokenEnvelope(payload: unknown): WebTokenGrant | null {
 }
 
 /**
- * Tokens sitting in plain sight inside the session jar — see harvestJarTokens
- * for which cookies qualify.
+ * Cookies a jar must carry for the exchange to even authenticate.
  *
- * `remixsid` is the classic session itself; a jar without it reads as
- * logged-out. The carriers are where sessions keep their API token: older
- * ones used `p`/`sua`, newer exports stash it in `remixnsid`/`remixnttpid`.
+ * `remixsid` is the classic vk.ru session; a jar without it reads as
+ * logged-out. `httoken` is the login-DOMAIN session token — set by and sent
+ * to login.vk.ru only, so a copy of vk.ru's Application→Cookies table never
+ * contains it. Measured 2026-08-26: a vk.ru-only 20-cookie jar answered
+ * "unauthorized" while a jar including httoken authenticated (and minted).
+ * Diagnostic only — renewal is still attempted without these; the note just
+ * explains a refusal.
+ *
+ * The CARRIERS are a separate matter: where sessions keep their API token
+ * (older `p`/`sua`, newer `remixnsid`/`remixnttpid`), needed only by the
+ * harvest fallback. A working exchange jar need not contain any — the
+ * 2026-08-26 mint succeeded with none of the four.
  */
-export const JAR_HARD_REQUIREMENTS = ["remixsid"];
+export const JAR_HARD_REQUIREMENTS = ["remixsid", "httoken"];
 export const JAR_TOKEN_CARRIERS = ["p", "sua", "remixnsid", "remixnttpid"];
 
 /**
@@ -422,10 +433,10 @@ async function runRenewal(): Promise<VkRenewResult> {
     };
   }
 
-  // remixsid IS the classic session; its absence predicts a LOGIN page. And a
-  // jar with no token-carrier cookie gets "unauthorized" from web_token and
-  // has nothing to harvest either, so say so up front rather than leaving the
-  // operator to guess why a logged-in-looking export is refused.
+  // Missing hard cookies predict specific refusals (see JAR_HARD_REQUIREMENTS);
+  // a carrier-less jar still exchanges fine (measured 2026-08-26) but leaves
+  // the harvest fallback nothing to try. Say so up front rather than leaving
+  // the operator to guess why a logged-in-looking export is refused.
   const missingHard = JAR_HARD_REQUIREMENTS.filter(
     (need) => !jar.names.some((n) => n.startsWith(need)),
   );
@@ -435,8 +446,10 @@ async function runRenewal(): Promise<VkRenewResult> {
     const bits: string[] = [];
     if (missingHard.length) bits.push(`jar lacks ${missingHard.join(", ")}`);
     if (carriers.length === 0)
-      bits.push(`no token-carrier cookie (${JAR_TOKEN_CARRIERS.join("/")})`);
-    jarNote = `; ${bits.join("; ")} — re-export the COMPLETE jar (HttpOnly included)`;
+      bits.push(
+        `no token-carrier cookie (${JAR_TOKEN_CARRIERS.join("/")}) — harvest will find nothing`,
+      );
+    jarNote = `; ${bits.join("; ")} — re-export: copy the Cookie header of a login.vk.ru request`;
   }
 
   let failure: Pick<VkRenewResult, "reason" | "detail"> = {
