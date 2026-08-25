@@ -16,14 +16,19 @@ import {
 /**
  * Operator tool for VK user-token renewal — the probe grew up.
  *
- * Runs exactly what the runtime renewer (src/lib/vkrenew.ts) runs: the
- * `login.vk.ru/?act=web_token` exchange against db/vkcookies.txt, then the
- * jar-harvest fallback. Use it to answer "would automatic renewal succeed
- * right now?" before anything is at stake, or to rotate the token by hand
- * when automation cannot.
+ * Two jobs:
+ *
+ * 1. Run exactly what the runtime renewer (src/lib/vkrenew.ts) runs: the
+ *    `login.vk.ru/?act=web_token` exchange against db/vkcookies.txt, then the
+ *    jar-harvest fallback. Use it to answer "would automatic renewal succeed
+ *    right now?" before anything is at stake.
+ * 2. Rotate by hand when automation cannot — the reliable path since VK began
+ *    refusing the server-side mint outright (measured 2026-08-25): mint in the
+ *    Mini App page, pipe the revealed token in on stdin.
  *
  *   npm run vkrenewprobe                 # attempt + report; installs nothing
  *   npm run vkrenewprobe -- --install    # also install a validated token
+ *   npm run vkrenewprobe -- --install --stdin   # install a PASTED token
  *   npm run vkrenewprobe -- --reveal     # print the token too (password-grade)
  *
  * Nothing is ever installed without passing photos.getWallUploadServer first,
@@ -32,6 +37,7 @@ import {
 
 const REVEAL = process.argv.includes("--reveal");
 const INSTALL = process.argv.includes("--install");
+const FROM_STDIN = process.argv.includes("--stdin");
 
 const APP_ID = Number(process.env.VK_APP_ID ?? "") || 54703482;
 
@@ -41,8 +47,21 @@ if (!Number.isFinite(parsedGroup) || parsedGroup === 0) {
   process.exit(1);
 }
 
-const HELP = `Create the jar from a logged-in VK tab, saved at db/vkcookies.txt
-(override with VK_COOKIE_FILE). Any ONE of these formats works:
+const HELP = `Manual rotation — always works, needs NO cookie jar:
+
+  Open the Mini App page INSIDE VK as a community admin
+  (frontend/public/vk-probe.html in the cyberjab repo), approve,
+  tap "Reveal token", then carry it here:
+
+    pbpaste | docker compose exec -T porter2 npm run vkrenewprobe \\
+        -- --install --stdin
+
+  The pasted token goes through the same photos.getWallUploadServer gate;
+  nothing is installed unless it can actually upload.
+
+Automatic renewal — rides a browser-session cookie jar saved at
+db/vkcookies.txt (override with VK_COOKIE_FILE). Any ONE of these
+formats works:
 
   A. Cookie header (no extension needed)
      Chrome -> open vk.ru -> DevTools -> Network -> click any vk.ru request
@@ -118,7 +137,32 @@ async function succeed(via: string, token: string, secondsLeft: number | null): 
   if (REVEAL) console.log(`\naccess_token (treat as a password):\n${token}`);
 }
 
+/**
+ * The manual-rotation path: a token minted in the Mini App page arrives on
+ * stdin (piped, so it never lands in shell history or `ps`). Validated by the
+ * shared gate inside succeed(); nothing is written without --install.
+ */
+async function installPastedToken(): Promise<void> {
+  console.log("VK token install — reading the pasted token from stdin …");
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  const token = Buffer.concat(chunks).toString("utf8").trim();
+
+  if (!/^vk1\.a\./.test(token)) {
+    console.error(
+      "stdin carried no vk1.a… token — copy exactly what the probe page\n" +
+        "reveals (tap Reveal token), including the vk1.a. prefix.",
+    );
+    process.exit(1);
+  }
+  // The Mini App grant reports no expiry we can carry over here; recorded as
+  // unknown and the watchdog's age-based watching takes over.
+  await succeed("pasted from the Mini App page", token, null);
+}
+
 async function main(): Promise<void> {
+  if (FROM_STDIN) return installPastedToken();
+
   const parsed = loadJar();
   const names = parsed.names;
 
@@ -157,7 +201,7 @@ async function main(): Promise<void> {
 
   const harvested = harvestJarTokens(parsed.header);
   console.log(
-    `jar harvest: ${harvested.length} candidate token(s) in p/sua` +
+    `jar harvest: ${harvested.length} candidate token(s) from carrier cookies` +
       harvested.map((t) => ` [${fingerprint(t)}]`).join(""),
   );
 
@@ -188,7 +232,7 @@ async function main(): Promise<void> {
     const verdict = await uploadRouteWorks(candidate);
     if (verdict.ok) {
       console.log("OK");
-      await succeed("harvested from jar (p/sua)", candidate, null);
+      await succeed("harvested from jar", candidate, null);
       return;
     }
     console.log(verdict.detail);
@@ -198,7 +242,12 @@ async function main(): Promise<void> {
   console.log(
     "\nIf MISSING cookies were listed above, fix that first — re-export the\n" +
       "complete jar from the logged-in tab (HttpOnly included) and retry.\n" +
-      "Otherwise paste the error above into the investigation.",
+      "If the jar was COMPLETE and still refused, VK is gating the mint itself\n" +
+      "(measured 2026-08-25: a full 20-cookie session still answers\n" +
+      '"unauthorized", and neither carrier cookie holds a usable token).\n' +
+      "Rotate by hand instead — see the manual-rotation block in the help\n" +
+      "above, or: pbpaste | docker compose exec -T porter2 npm run \\\n" +
+      "  vkrenewprobe -- --install --stdin",
   );
   process.exit(2);
 }

@@ -482,7 +482,7 @@ async function runRenewal(): Promise<VkRenewResult> {
     }
     // No expiry is published for these; the store records it as unknown and
     // the watchdog falls back to age.
-    return await install(candidate, null, "harvested from jar (p/sua)");
+    return await install(candidate, null, "harvested from jar");
   }
 
   logger.warn(`[vk-renew] renewal failed — ${failure.reason}: ${failure.detail}${jarNote}`);

@@ -142,14 +142,20 @@ async function notify(
       ? "🔴 <b>VK user token expired</b>\nPosts are publishing without their photos."
       : "🟡 <b>VK user token is about to expire</b>\nPhotos stop attaching when it does.";
 
+  // The Mini App rotation leads because it always works; VK currently refuses
+  // the unattended mint outright even against a complete cookie jar, so jar
+  // advice only makes sense when the failure reason says the JAR was the
+  // problem. /health confirms recovery either way.
   const text =
     `${head}\n<i>${detail}</i>\n` +
     (renewalContext ? `<i>${renewalContext}</i>\n` : "") +
-    "\nAutomatic renewal needs a live browser session in " +
-    "<code>db/vkcookies.txt</code>: re-export the cookies of a logged-in " +
-    "vk.ru tab and it recovers on its own within the hour. To fix right " +
-    "now, mint a token in the Mini App and paste it into " +
-    "<code>VK_USER_TOKEN</code>. Check with <code>/health</code>.";
+    "\nFix: open the Mini App page inside VK as an admin → Request access → " +
+    "Reveal token, then\n<code>pbpaste | docker compose exec -T porter2 npm " +
+    "run vkrenewprobe -- --install --stdin</code>\n" +
+    "(validated before anything is installed). Automatic renewal rides " +
+    "<code>db/vkcookies.txt</code>; if the failure above names the jar, " +
+    "re-exporting a logged-in vk.ru tab's cookies may restore it. Check with " +
+    "<code>/health</code>.";
 
   for (const id of ids) {
     try {
