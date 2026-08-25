@@ -13,6 +13,7 @@ import {
   getVkUserAccessToken,
   vkUserTokenInfo,
 } from "@/lib/vkuser";
+import { vkTokenStatus } from "@/lib/vktokenwatch";
 import logger from "@/lib/logger";
 import {
   render,
@@ -272,9 +273,14 @@ async function checkVkUser(): Promise<Check> {
       return { ...base, verdict: "warn", summary: "no upload_url", ms: res.ms };
     }
 
-    // Reachable is not the same as healthy. These tokens last 24h, so one that
-    // works right now can still be hours from taking the photos off every post,
-    // and a report that only says "reachable" would call that green.
+    // Reachable is not the same as healthy. These tokens expire on their own
+    // schedule (24 h for a Mini App grant, ~15 min for a web_token mint), so
+    // one that works right now can still be moments from taking the photos off
+    // every post, and a report that only says "reachable" would call that
+    // green. "About to expire" is whatever the watchdog calls it — a threshold
+    // proportional to the token's observed life, so a short-lived mint whose
+    // WHOLE existence is near-expiry stays green while renewal keeps up, and
+    // only degrades this report once automation has stopped saving it.
     const info = vkUserTokenInfo();
     const detail = [
       `target group: ${link(`https://vk.ru/club${groupId}`, `-${groupId}`)}`,
@@ -287,12 +293,13 @@ async function checkVkUser(): Promise<Check> {
       )}`,
     ];
 
-    const soon = info.remainingHours !== null && info.remainingHours <= 6;
+    const watch = vkTokenStatus();
+    const soon = watch.severity !== "ok";
     return {
       ...base,
       verdict: soon ? "warn" : "ok",
       summary: soon
-        ? `upload route reachable, but expires in ${info.remainingHours!.toFixed(1)} h`
+        ? `upload route reachable, but token ${watch.severity} — ${watch.detail}`
         : "upload route reachable",
       ms: res.ms,
       detail,

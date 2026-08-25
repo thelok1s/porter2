@@ -30,6 +30,11 @@ import { PorterConfig as config } from "../../porter.config";
  */
 
 const DEFAULT_INTERVAL_MINUTES = 30;
+/**
+ * Ceiling on how early a token counts as "about to expire" — proportional to
+ * the OBSERVED life in practice (see warnBelowHours), so this only binds for
+ * long-lived grants: 24 h × ¼ = the tuned six hours exactly.
+ */
 const DEFAULT_WARN_BEFORE_HOURS = 6;
 
 /**
@@ -91,6 +96,27 @@ function observedLifetimeHours(info: VkUserTokenInfo): number | null {
   if (!info.present || info.remainingHours === null) return null;
   const lifetime = info.remainingHours + (info.ageHours ?? 0);
   return Number.isFinite(lifetime) && lifetime > 0 ? lifetime : null;
+}
+
+/**
+ * Hours-left under which the token counts as "about to expire".
+ *
+ * Proportional like everything else here: a quarter of the OBSERVED life,
+ * capped by the configured warnBeforeHours so a 24 h grant keeps the tuned
+ * six hours exactly. A fifteen-minute web_token mint therefore sits at "ok"
+ * for almost its whole life — being near expiry is its NORMAL state, and the
+ * watchdog swaps it around minute eleven — and only crosses into "expiring"
+ * once automation has demonstrably stopped keeping up. A fixed threshold
+ * would instead flag every fresh short-lived mint (0.2 h left of a 15-min
+ * grant is 80% of its life remaining) and degrade /health plus page the
+ * operator on every boot for a token working exactly as designed.
+ */
+function warnBelowHours(info: VkUserTokenInfo): number {
+  const configured =
+    config.vkToken?.warnBeforeHours ?? DEFAULT_WARN_BEFORE_HOURS;
+  const lifetime = observedLifetimeHours(info);
+  if (lifetime === null) return configured;
+  return Math.min(configured, lifetime * 0.25);
 }
 
 /**
@@ -183,7 +209,7 @@ function classify(): { severity: Severity; detail: string } {
         detail: `expired ${Math.abs(info.remainingHours).toFixed(1)} h ago`,
       };
     }
-    const warnBelow = config.vkToken?.warnBeforeHours ?? DEFAULT_WARN_BEFORE_HOURS;
+    const warnBelow = warnBelowHours(info);
     if (info.remainingHours <= warnBelow) {
       return {
         severity: "expiring",
@@ -209,6 +235,18 @@ function classify(): { severity: Severity; detail: string } {
     };
   }
   return { severity: "ok", detail: `no expiry reported, ${age.toFixed(1)} h old` };
+}
+
+export type VkTokenSeverity = Severity;
+
+/**
+ * What the watch currently thinks of the held token, computed fresh on every
+ * call — exported so /health grades the token by the SAME standard the
+ * operator is alerted by, rather than growing its own (and inevitably fixed-
+ * hour) threshold next to this one.
+ */
+export function vkTokenStatus(): { severity: VkTokenSeverity; detail: string } {
+  return classify();
 }
 
 async function notify(
