@@ -11,6 +11,7 @@ import {
   JAR_HARD_REQUIREMENTS,
   JAR_TOKEN_CARRIERS,
   WEB_CLIENT_APP_ID,
+  candidateAppIds,
 } from "../lib/vkrenew";
 
 /**
@@ -22,9 +23,10 @@ import {
  *    `login.vk.ru/?act=web_token` exchange against db/vkcookies.txt, then the
  *    jar-harvest fallback. Use it to answer "would automatic renewal succeed
  *    right now?" before anything is at stake.
- * 2. Rotate by hand when automation cannot — the reliable path since VK began
- *    refusing the server-side mint outright (measured 2026-08-25): mint in the
- *    Mini App page, pipe the revealed token in on stdin.
+ * 2. Rotate by hand when you want a LONG-lived grant: the automatic mint now
+ *    works again but under VK's own web-client app id, whose tokens live only
+ *    ~15 min (measured 2026-08-26). A Mini App page token pasted on stdin
+ *    lasts ~24 h — worth the minute of work whenever the churn annoys you.
  *
  *   npm run vkrenewprobe                 # attempt + report; installs nothing
  *   npm run vkrenewprobe -- --install    # also install a validated token
@@ -60,8 +62,9 @@ const HELP = `Manual rotation — always works, needs NO cookie jar:
   nothing is installed unless it can actually upload.
 
 Automatic renewal — rides a browser-session cookie jar saved at
-db/vkcookies.txt (override with VK_COOKIE_FILE). Any ONE of these
-formats works:
+db/vkcookies.txt (override with VK_COOKIE_FILE). Mints come from VK's
+web-client app id and last only ~15 min; the watchdog renews on that cadence
+by itself. Any ONE of these formats works:
 
   A. Cookie header (no extension needed)
      Chrome -> open vk.ru -> DevTools -> Network -> click any vk.ru request
@@ -113,7 +116,11 @@ async function succeed(via: string, token: string, secondsLeft: number | null): 
   console.log(`    fingerprint: ${fingerprint(token)}  (length ${token.length})`);
   if (secondsLeft !== null) {
     const eta = new Date(Date.now() + secondsLeft * 1000).toISOString();
-    console.log(`    lifetime:    ${(secondsLeft / 3600).toFixed(1)} h (until ~${eta})`);
+    const life =
+      secondsLeft < 3600
+        ? `${Math.round(secondsLeft / 60)} min`
+        : `${(secondsLeft / 3600).toFixed(1)} h`;
+    console.log(`    lifetime:    ${life} (until ~${eta})`);
   } else {
     console.log("    lifetime:    unknown (VK reported none we could trust)");
   }
@@ -167,8 +174,8 @@ async function main(): Promise<void> {
   const names = parsed.names;
 
   console.log(
-    `VK renewal tool — app ${APP_ID} (+${WEB_CLIENT_APP_ID} fallback), ` +
-      `${INSTALL ? "INSTALL MODE" : "dry run"}\n`,
+    `VK renewal tool — app ${WEB_CLIENT_APP_ID} (VK web client) + ` +
+      `${APP_ID} fallback, ${INSTALL ? "INSTALL MODE" : "dry run"}\n`,
   );
   console.log(`cookies: ${names.length} loaded from ${cookieJarPath()}  (${parsed.format})`);
 
@@ -205,9 +212,9 @@ async function main(): Promise<void> {
       harvested.map((t) => ` [${fingerprint(t)}]`).join(""),
   );
 
-  // The production route, both app ids × both body shapes. First success wins.
+  // The production route, same app-id order as production (candidateAppIds).
   let jarHeader = parsed.header;
-  for (const appId of [...new Set([APP_ID, WEB_CLIENT_APP_ID])]) {
+  for (const appId of candidateAppIds()) {
     for (const bodyToken of [null, held]) {
       const shape = bodyToken ? "token-in-body" : "cookies-only";
       process.stdout.write(`\nPOST act=web_token · app ${appId} · ${shape} … `);
@@ -240,13 +247,14 @@ async function main(): Promise<void> {
 
   console.log("\nVERDICT: every route refused.");
   console.log(
-    "\nIf MISSING cookies were listed above, fix that first — re-export the\n" +
-      "complete jar from the logged-in tab (HttpOnly included) and retry.\n" +
-      "If the jar was COMPLETE and still refused, VK is gating the mint itself\n" +
-      "(measured 2026-08-25: a full 20-cookie session still answers\n" +
-      '"unauthorized", and neither carrier cookie holds a usable token).\n' +
-      "Rotate by hand instead — see the manual-rotation block in the help\n" +
-      "above, or: pbpaste | docker compose exec -T porter2 npm run \\\n" +
+    "\nIf MISSING cookies were listed above, fix that first — the session must\n" +
+      "authenticate before any app id is considered.\n" +
+      "If the jar was COMPLETE and still refused: VK accepts only some jars.\n" +
+      "(Measured 2026-08-26: a full DevTools export answered \"unauthorized\",\n" +
+      "a trimmed ~22-cookie session minted under app 6287487 — so jar shape,\n" +
+      "not just presence, matters. Mints under 6287487 live only ~15 min.)\n" +
+      "For a LONG-lived (~24 h) token, rotate by hand — see the manual-rotation\n" +
+      "block in the help above, or: pbpaste | docker compose exec -T porter2 npm run \\\n" +
       "  vkrenewprobe -- --install --stdin",
   );
   process.exit(2);

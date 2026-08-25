@@ -126,3 +126,18 @@ export function loadCookieJar(file: string = cookieJarPath()): CookieJar | null 
     return null;
   }
 }
+
+/**
+ * Persist a jar header back to disk — used after a renewal folds in whatever
+ * Set-Cookie answers VK returned, so the next attempt starts from the session
+ * VK last saw instead of one rotation behind.
+ *
+ * Written as a plain Cookie header at 0600: the file is ACCOUNT-GRADE (it
+ * authenticates as the user), matching the gitignore note on db/vkcookies*.
+ */
+export function saveCookieJar(
+  header: string,
+  file: string = cookieJarPath(),
+): void {
+  fs.writeFileSync(file, header + "\n", { mode: 0o600 });
+}

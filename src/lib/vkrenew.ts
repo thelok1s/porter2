@@ -3,7 +3,7 @@ import { API } from "vk-io";
 
 import logger from "@/lib/logger";
 import { getVkUserAccessToken, saveVkUserToken } from "@/lib/vkuser";
-import { loadCookieJar } from "@/lib/vkcookies";
+import { loadCookieJar, saveCookieJar } from "@/lib/vkcookies";
 
 /**
  * Unattended renewal of the VK user token.
@@ -32,17 +32,23 @@ import { loadCookieJar } from "@/lib/vkcookies";
  * through the same validation gate, so a jar good enough to log in with can
  * often restore service even when the exchange endpoint refuses.
  *
- * Two things are genuinely unknown and both are handled rather than assumed:
- *   • Whether OUR app id works in the body. The captures carried 6287487 —
- *     VK's own client id. Candidates are tried in order (ours first, then
- *     theirs), and every minted token must pass photos.getWallUploadServer
- *     before it is allowed near the store, so a wrong-scope token is
- *     discarded. Fail closed: keep the old token, post text-only.
- *   • What `expires` MEANS. The one sample parsed as absolute unix seconds —
- *     yet landed ~44 min BEFORE the response's own Date header, so trusting a
- *     non-positive remainder would store a born-dead stamp and alarm forever.
- *     A remainder that does not come out positive is recorded as UNKNOWN, and
- *     age-based watching takes over.
+ * Which app id mints is no longer a guess (measured 2026-08-26 from the
+ * server): OUR Mini App id answers {"error_info":"not allowed"} for a session
+ * that clearly authenticates, while VK's own web-client id 6287487 MINTS —
+ * tokens that pass validation but live only ~899 s. So the web client's id is
+ * the PRIMARY candidate and ours stays as a fallback for the day VK relaxes;
+ * every minted token must still pass photos.getWallUploadServer before it is
+ * allowed near the store, so a wrong-scope token is discarded. Fail closed:
+ * keep the old token, post text-only.
+ *
+ * What `expires` MEANS varies by issuer: Mini App grants read as 24 h, while
+ * web-client mints return ~15 min either way it is parsed. The magnitude rule
+ * below handles both; a remainder that does not come out positive is recorded
+ * as UNKNOWN, and age-based watching takes over.
+ *
+ * Cookies VK rotates during an exchange are folded back into the jar file on
+ * disk (see saveCookieJar), so each attempt starts from the session VK last
+ * saw rather than one rotation behind.
  *
  * The token is password-grade and the cookie jar IS the account: neither is
  * ever logged, not even truncated — failures quote only VK's redacted error
@@ -54,14 +60,30 @@ const ENDPOINT = "https://login.vk.ru/?act=web_token";
 const ORIGIN = "https://vk.ru";
 
 /**
- * The app id VK's web client uses for itself — what both captures carried. A
- * fallback candidate when our own app id is refused.
+ * The app id VK's web client uses for itself — what both captures carried, and
+ * (measured 2026-08-26) the ONLY id the endpoint currently mints for: tokens
+ * under it validate against photos.getWallUploadServer but live ~15 min. The
+ * PRIMARY candidate; our own Mini App id is tried after it in case VK ever
+ * re-allows third-party mints.
  */
 export const WEB_CLIENT_APP_ID = 6287487;
 
 /** Our Mini App, overridable for testing another one without a code change. */
 function configuredAppId(): number {
   return Number(process.env.VK_APP_ID ?? "") || 54703482;
+}
+
+/**
+ * App ids to try, in order — one source of truth shared with vkrenewprobe.
+ *
+ * Default puts the web client's id FIRST because that is the only one VK
+ * currently mints for (measured 2026-08-26). An explicitly set VK_APP_ID
+ * jumps ahead of it: whoever sets the variable means THEIR app to be tried.
+ */
+export function candidateAppIds(): number[] {
+  const mine = configuredAppId();
+  if (process.env.VK_APP_ID) return [...new Set([mine, WEB_CLIENT_APP_ID])];
+  return [...new Set([WEB_CLIENT_APP_ID, mine])];
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -422,13 +444,28 @@ async function runRenewal(): Promise<VkRenewResult> {
     detail: "no candidate attempted",
   };
 
-  // Ours first: a token minted under OUR app is the one we know carries the
-  // right grants. The web client's app id exists because the captures proved
-  // the route accepts it, and validation below polices whatever scopes come
-  // back. Per app id, the cookie-only body goes first — it is the shape the
+  // The web client's id first by default: measured 2026-08-26 it is the only
+  // one VK currently mints for (ours answers "not allowed"), and every doomed
+  // request ahead of a working one just burns latency. See candidateAppIds.
+  // Per app id, the cookie-only body goes first — it is the shape the
   // proven-working desktop client sends.
-  const candidates = [...new Set([configuredAppId(), WEB_CLIENT_APP_ID])];
+  const candidates = candidateAppIds();
   let jarHeader = jar.header;
+
+  // Fold rotated cookies back to disk after a SUCCESSFUL mint, so tomorrow's
+  // attempt starts from the session VK last saw. Best effort only — a read-only
+  // volume must not turn a good renewal into a failure. Never logged: the jar
+  // is account-grade.
+  const persistJar = (): void => {
+    try {
+      saveCookieJar(jarHeader);
+    } catch (error) {
+      logger.warn(
+        `[vk-renew] could not persist the rotated cookie jar: ` +
+          `${String(error).slice(0, 120)}`,
+      );
+    }
+  };
 
   for (const appId of candidates) {
     for (const bodyToken of [null, current]) {
@@ -462,6 +499,7 @@ async function runRenewal(): Promise<VkRenewResult> {
         continue;
       }
 
+      persistJar();
       return await install(
         attempt.grant.token,
         attempt.grant.secondsRemaining,

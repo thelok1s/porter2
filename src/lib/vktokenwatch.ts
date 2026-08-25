@@ -8,10 +8,16 @@ import { PorterConfig as config } from "../../porter.config";
  * Watches the VK user token, renews it unattended when it can, and says
  * something only when automation could not save it.
  *
- * The token carries `expires_in=86400`. That makes expiry a daily certainty
- * rather than an incident, and its symptom is close to invisible: posts keep
- * publishing, they just quietly lose their picture. Nothing errors, nothing
- * retries, and the first sign is somebody noticing a bare post days later.
+ * Expiry is a certainty rather than an incident: Mini App grants live 24 h,
+ * and web_token mints under VK's own web-client app id came back with ~15 min
+ * (measured 2026-08-26). Its symptom is close to invisible either way: posts
+ * keep publishing, they just quietly lose their picture. Nothing errors,
+ * nothing retries, and the first sign is somebody noticing a bare post days
+ * later.
+ *
+ * Because lifetimes vary by orders of magnitude, nothing here is fixed-cadence:
+ * the renewal trigger, the retry floor and the tick interval all scale with
+ * whatever life the CURRENT token reports (see observedLifetimeHours).
  *
  * Renewal rides `login.vk.ru/?act=web_token` — the exchange VK's own web
  * client makes for an already-approved Mini App (see src/lib/vkrenew.ts for
@@ -31,11 +37,25 @@ const DEFAULT_WARN_BEFORE_HOURS = 6;
  * quarters through the measured 24 h life, so the swap happens while the old
  * token still works (the web_token exchange has only ever been observed with
  * a live token in the body).
+ *
+ * For a SHORT-lived grant the same three-quarters rule applies
+ * proportionally (see renewalDue); this constant only caps it.
  */
 const DEFAULT_RENEW_AHEAD_HOURS = 18;
 
-/** Floor between renewal attempts, so a dead jar cannot hammer VK hourly. */
-const MIN_RENEW_GAP_MINUTES = 60;
+/**
+ * Ceiling between renewal attempts, so a dead jar cannot hammer VK. The
+ * actual floor scales with the observed lifetime of the held token — a
+ * fifteen-minute grant renewed hourly would spend three quarters of its life
+ * already dead (see renewGapMs).
+ */
+const MAX_RENEW_GAP_MINUTES = 60;
+
+/** Never attempt renewal more often than this, whatever the lifetime. */
+const MIN_RENEW_GAP_MS = 90_000;
+
+/** Never wake the watch more often than this, whatever the lifetime. */
+const MIN_TICK_MS = 45_000;
 
 /**
  * When VK reports no expiry, warn on age instead.
@@ -48,7 +68,7 @@ const ASSUMED_LIFETIME_HOURS = 24;
 
 type Severity = "expired" | "expiring" | "ok";
 
-let timer: ReturnType<typeof setInterval> | null = null;
+let timer: ReturnType<typeof setTimeout> | null = null;
 /**
  * The last severity announced.
  *
@@ -62,19 +82,84 @@ let announced: Severity | null = null;
 let lastRenewAttempt = 0;
 
 /**
+ * The lifetime VK gave the held token, in hours — remaining plus age. The
+ * regime decides the whole cadence: Mini App tokens measured ~24 h, while
+ * web_token grants minted under VK's own web-client app id came back with
+ * `expires` ≈ 899 s (measured 2026-08-26). Null when nothing is known.
+ */
+function observedLifetimeHours(info: VkUserTokenInfo): number | null {
+  if (!info.present || info.remainingHours === null) return null;
+  const lifetime = info.remainingHours + (info.ageHours ?? 0);
+  return Number.isFinite(lifetime) && lifetime > 0 ? lifetime : null;
+}
+
+/**
  * Whether this token needs attention soon enough to try renewing it now.
  *
- * With a reported expiry the remaining hours decide. Without one (a hand-
- * pasted token carries no issue time VK shares), age stands in for it against
- * the same threshold — the measured 24 h life means an old unknown is as
- * dangerous as a near-expired known.
+ * With a reported expiry the trigger is three quarters through the OBSERVED
+ * life — capped by the configured ahead-hours so a long-lived token keeps the
+ * tuned behaviour exactly (24 h × ¾ = the old 18 h). A fifteen-minute grant
+ * therefore renews around its eleventh minute instead of dying on the floor.
+ *
+ * Without a reported expiry (a hand-pasted token carries no issue time VK
+ * shares), age stands in against the same threshold — the measured 24 h life
+ * means an old unknown is as dangerous as a near-expired known.
  */
 function renewalDue(info: VkUserTokenInfo): boolean {
   if (!info.present) return false;
   const aheadHours =
     config.vkToken?.renewAheadHours ?? DEFAULT_RENEW_AHEAD_HOURS;
-  if (info.remainingHours !== null) return info.remainingHours <= aheadHours;
+  if (info.remainingHours !== null) {
+    const lifetime = observedLifetimeHours(info);
+    if (lifetime !== null) {
+      return info.remainingHours <= Math.min(aheadHours, lifetime * 0.75);
+    }
+    return info.remainingHours <= aheadHours;
+  }
   return (info.ageHours ?? 0) >= aheadHours;
+}
+
+/**
+ * Floor between renewal ATTEMPTS — the anti-hammer guard for a failing jar.
+ * Proportional to the observed life (a third of it) and clamped to sane
+ * bounds: a 15-min grant may retry every ~5 min; a 24-h one keeps the old
+ * once-an-hour ceiling. Successes reset nothing here — only failures ever
+ * feel this floor, because a success replaces the token outright.
+ */
+function renewGapMs(info: VkUserTokenInfo): number {
+  const lifetime = observedLifetimeHours(info);
+  if (lifetime === null) return MAX_RENEW_GAP_MINUTES * 60_000;
+  return Math.min(
+    MAX_RENEW_GAP_MINUTES * 60_000,
+    Math.max(MIN_RENEW_GAP_MS, (lifetime / 3) * 3_600_000),
+  );
+}
+
+/**
+ * How long to sleep before the next look.
+ *
+ * Scaled from what is left of the token — about a quarter of the remaining
+ * life, so any grant gets several chances to be renewed before it matters —
+ * and clamped between a fast floor and the configured interval.
+ */
+function nextDelayMs(): number {
+  const base =
+    (config.vkToken?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES) * 60_000;
+  const { remainingHours } = vkUserTokenInfo();
+  if (remainingHours === null || remainingHours <= 0) return base;
+  return Math.max(MIN_TICK_MS, Math.min(base, (remainingHours * 3_600_000) / 4));
+}
+
+function scheduleNext(): void {
+  const delay = nextDelayMs();
+  timer = setTimeout(() => {
+    timer = null;
+    // Reschedule no matter how this tick ended, so one throw cannot kill the
+    // watch silently.
+    void tick().finally(scheduleNext);
+  }, delay);
+  // Do not hold the process open on this alone.
+  timer.unref?.();
 }
 
 function superAdminIds(): number[] {
@@ -167,13 +252,12 @@ async function notify(
 }
 
 async function tick(): Promise<void> {
+  const info = vkUserTokenInfo();
+
   // Renew BEFORE alerting. A success resets the clock so the alert below
   // simply never fires; a failure becomes context on whatever warning follows.
   let renewalContext = "";
-  if (
-    renewalDue(vkUserTokenInfo()) &&
-    Date.now() - lastRenewAttempt >= MIN_RENEW_GAP_MINUTES * 60_000
-  ) {
+  if (renewalDue(info) && Date.now() - lastRenewAttempt >= renewGapMs(info)) {
     lastRenewAttempt = Date.now();
     const result = await renewVkUserToken();
     if (result.ok) {
@@ -215,19 +299,18 @@ export function startVkTokenWatch(): void {
   }
   if (timer) return;
 
-  const minutes = config.vkToken?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES;
-  timer = setInterval(() => void tick(), minutes * 60_000);
-  // Do not hold the process open on this alone.
-  timer.unref?.();
-  logger.info(`[vk-watch] watching the VK user token every ${minutes} min`);
+  logger.info(
+    `[vk-watch] watching the VK user token — cadence adapts to the held ` +
+      `token's life, capped at ${config.vkToken?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES} min`,
+  );
 
   // Check once at startup rather than waiting out a full interval — a token
   // that died overnight should be reported at boot, not half an hour later.
-  void tick();
+  void tick().finally(scheduleNext);
 }
 
 export function stopVkTokenWatch(): void {
   if (!timer) return;
-  clearInterval(timer);
+  clearTimeout(timer);
   timer = null;
 }
