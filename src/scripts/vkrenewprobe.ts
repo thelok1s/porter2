@@ -32,6 +32,12 @@ import {
  *   npm run vkrenewprobe -- --install    # also install a validated token
  *   npm run vkrenewprobe -- --install --stdin   # install a PASTED token
  *   npm run vkrenewprobe -- --reveal     # print the token too (password-grade)
+ *   npm run vkrenewprobe -- --sweep      # survey app ids for a LONGER life
+ *
+ * 3. Answer "is there a longer-lived token we could renew just as easily?"
+ *    (`--sweep`). The incumbent mints ~15 min, so the watch re-mints ~200×/day;
+ *    the sweep measures whether any other app id does better through the same
+ *    exchange. Adopting a winner is one variable, VK_APP_ID. Installs nothing.
  *
  * Nothing is ever installed without passing photos.getWallUploadServer first,
  * same gate as production.
@@ -40,8 +46,48 @@ import {
 const REVEAL = process.argv.includes("--reveal");
 const INSTALL = process.argv.includes("--install");
 const FROM_STDIN = process.argv.includes("--stdin");
+const SWEEP = process.argv.includes("--sweep");
 
 const APP_ID = Number(process.env.VK_APP_ID ?? "") || 54703482;
+
+/**
+ * App ids to SURVEY for a longer-lived grant (`--sweep`).
+ *
+ * The question this answers: the incumbent (VK's web client, 6287487) mints
+ * tokens that live ~15 min, so the watchdog re-mints ~200×/day. Does any other
+ * app id mint a LONGER-lived token through the very same exchange — same cookie
+ * jar, same endpoint, only `app_id` differs? If one does, adopting it costs a
+ * single environment variable: VK_APP_ID jumps to the front of candidateAppIds
+ * and the whole existing pipeline picks it up unchanged.
+ *
+ * These are VK's own publicly-known client ids — the values their clients ship
+ * and that appear throughout VK's public API documentation and community
+ * tooling. They are surveyed, never assumed: what a token is WORTH here is
+ * decided by photos.getWallUploadServer, the same gate production uses, so an
+ * id that mints something with the wrong scope is reported and discarded rather
+ * than adopted.
+ *
+ * NOTE the account-side tradeoff before adopting one: minting under a client id
+ * that is not ours is exactly what the session's own browser already does, but
+ * a server doing it on a schedule is a pattern VK may rate-limit or flag. That
+ * is a risk to THIS account, so the decision belongs to the operator; the sweep
+ * only supplies the measurement.
+ */
+const SURVEY_APP_IDS: { id: number; label: string }[] = [
+  { id: 6287487, label: "VK web client (incumbent — the ~15 min one)" },
+  { id: 2274003, label: "VK Android" },
+  { id: 3140623, label: "VK iPhone" },
+  { id: 3682744, label: "VK iPad" },
+  { id: 3697615, label: "VK Windows" },
+  { id: 6146827, label: "VK Me" },
+  { id: 7913379, label: "VK Calls" },
+  { id: 5027722, label: "VK Admin" },
+];
+
+/** Politeness gap between sweep requests, so a survey is not a burst. */
+const SWEEP_GAP_MS = 700;
+const pause = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 const parsedGroup = parseInt(process.env.VK_GROUP_ID ?? "");
 if (!Number.isFinite(parsedGroup) || parsedGroup === 0) {
@@ -171,8 +217,116 @@ async function installPastedToken(): Promise<void> {
   await succeed("pasted from the Mini App page", token, null);
 }
 
+/**
+ * Survey every candidate app id for a longer-lived grant. Installs NOTHING —
+ * this is a measurement, and adopting a result is a deliberate second step
+ * (set VK_APP_ID). Tokens minted along the way are validated so the report can
+ * say whether each would actually have been usable, and are never printed.
+ */
+async function sweep(): Promise<void> {
+  const parsed = loadJar();
+  let jarHeader = parsed.header;
+  const held = await getVkUserAccessToken();
+
+  console.log(
+    "VK app-id survey — which id mints the LONGEST-lived usable token?\n" +
+      `cookies: ${parsed.names.length} from ${cookieJarPath()} (${parsed.format})\n` +
+      "Nothing is installed. Same jar, same endpoint; only app_id differs.\n",
+  );
+
+  type Row = { id: number; label: string; life: number | null; usable: boolean; note: string };
+  const rows: Row[] = [];
+
+  for (const { id, label } of SURVEY_APP_IDS) {
+    process.stdout.write(`app ${String(id).padEnd(9)} ${label.padEnd(42)} … `);
+    let row: Row = { id, label, life: null, usable: false, note: "refused" };
+
+    // Cookies-only is the shape the working capture used; fall back to
+    // token-in-body only if that is refused, mirroring production's order.
+    // With no token held the second shape IS the first — skip it rather than
+    // sending the same request twice for every id in the survey.
+    for (const bodyToken of held ? [null, held] : [null]) {
+      try {
+        const res = await postWebToken(id, bodyToken, jarHeader);
+        jarHeader = res.jarHeader;
+        if (res.attempt.kind !== "minted") {
+          row.note = res.attempt.detail.replace(/\s+/g, " ").slice(0, 70);
+          await pause(SWEEP_GAP_MS);
+          continue;
+        }
+        const secs = res.attempt.grant.secondsRemaining;
+        const verdict = await uploadRouteWorks(res.attempt.grant.token);
+        row = {
+          id,
+          label,
+          life: secs,
+          usable: verdict.ok,
+          note: verdict.ok ? "minted + upload OK" : `minted but ${verdict.detail.slice(0, 50)}`,
+        };
+        break;
+      } catch (e) {
+        row.note = String(e).slice(0, 70);
+      }
+      await pause(SWEEP_GAP_MS);
+    }
+
+    const lifeText =
+      row.life === null
+        ? row.usable
+          ? "lifetime unreported"
+          : ""
+        : row.life < 3600
+          ? `${Math.round(row.life / 60)} min`
+          : `${(row.life / 3600).toFixed(1)} h`;
+    console.log(`${row.usable ? "MINTED" : "no"}  ${lifeText}  ${row.note}`);
+    rows.push(row);
+    await pause(SWEEP_GAP_MS);
+  }
+
+  const usable = rows.filter((r) => r.usable);
+  console.log("\n── verdict ─────────────────────────────────────────────");
+  if (usable.length === 0) {
+    console.log(
+      "No app id minted a usable token. If the incumbent also failed, the JAR\n" +
+        "is the problem, not the app id — re-export it (see --help) and re-run.",
+    );
+    process.exit(2);
+  }
+
+  // An unreported lifetime sorts last: an unknown is not evidence of a long
+  // life, and adopting one would trade a measured 15 min for a guess.
+  const ranked = [...usable].sort((a, b) => (b.life ?? -1) - (a.life ?? -1));
+  const best = ranked[0];
+  const incumbent = rows.find((r) => r.id === WEB_CLIENT_APP_ID);
+
+  for (const r of ranked) {
+    const life = r.life === null ? "unreported" : `${Math.round(r.life / 60)} min`;
+    console.log(`  usable: app ${String(r.id).padEnd(9)} ${life.padStart(10)}  ${r.label}`);
+  }
+
+  const beats =
+    best.life !== null && incumbent?.life != null && best.life > incumbent.life * 1.5;
+  console.log();
+  if (beats) {
+    console.log(
+      `Best: app ${best.id} at ~${Math.round(best.life! / 60)} min — ` +
+        `${(best.life! / (incumbent!.life || 1)).toFixed(1)}× the incumbent.\n` +
+        `Adopt with:  VK_APP_ID=${best.id}   (then restart; candidateAppIds puts it first)\n` +
+        "Re-run this sweep after a day — VK has changed which ids mint before.",
+    );
+  } else {
+    console.log(
+      "Nothing beats the incumbent meaningfully. Keep the current setup: the\n" +
+        "watchdog already re-mints on the short cadence without operator action.\n" +
+        "For a LONG (~24 h) grant, manual Mini App rotation remains the only\n" +
+        "measured option — see the help text above.",
+    );
+  }
+}
+
 async function main(): Promise<void> {
   if (FROM_STDIN) return installPastedToken();
+  if (SWEEP) return sweep();
 
   const parsed = loadJar();
   const names = parsed.names;
