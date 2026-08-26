@@ -402,7 +402,11 @@ async function install(
 ): Promise<VkRenewResult> {
   const hours = secondsLeft !== null ? secondsLeft / 3600 : null;
   saveVkUserToken(token, secondsLeft, "renewal");
-  logger.info(
+  // A successful mint is the routine case — the watch renews short-lived
+  // web_token grants every few minutes, so this line lives at debug rather than
+  // spamming the operator log. Failures stay at warn (see runRenewal), and
+  // /health still reports the live token state on demand.
+  logger.debug(
     `[vk-renew] token renewed via ${via} (fingerprint ${fingerprint(token)}, valid ` +
       `${hours !== null ? `${hours.toFixed(1)} h` : "for an unknown time"})`,
   );
@@ -521,14 +525,23 @@ async function runRenewal(): Promise<VkRenewResult> {
     }
   }
 
+  // The candidate loop's outcome is the REAL story: web_token is the path that
+  // normally works, so its refusal (a transient 502, a momentary Code 5, an
+  // "unauthorized" from a stale jar) is what the operator needs to see.
+  // Snapshot it before the harvest fallback runs so a stale carrier's rejection
+  // cannot overwrite it — those `p`/`sua`/`remixnsid`/`remixnttpid` tokens are
+  // usually long dead, and reporting THEIR "invalid access_token" as the
+  // headline sent past operators re-exporting cookies for a jar that was fine.
+  const primaryFailure = failure;
+
   // Last resort before giving up: the jar itself may carry a usable token.
   for (const candidate of harvestJarTokens(jarHeader)) {
     const verdict = await uploadRouteWorks(candidate);
     if (!verdict.ok) {
-      failure = {
-        reason: "validation",
-        detail: `harvested jar token rejected — ${verdict.detail}`,
-      };
+      // A dead carrier is the norm, not news — keep it out of the headline and
+      // out of the operator log; it is only ever a footnote to the real
+      // (web_token) failure above.
+      logger.debug(`[vk-renew] harvested jar token rejected — ${verdict.detail}`);
       continue;
     }
     // No expiry is published for these; the store records it as unknown and
@@ -536,6 +549,8 @@ async function runRenewal(): Promise<VkRenewResult> {
     return await install(candidate, null, "harvested from jar");
   }
 
-  logger.warn(`[vk-renew] renewal failed — ${failure.reason}: ${failure.detail}${jarNote}`);
-  return { ...none, ...failure };
+  logger.warn(
+    `[vk-renew] renewal failed — ${primaryFailure.reason}: ${primaryFailure.detail}${jarNote}`,
+  );
+  return { ...none, ...primaryFailure };
 }

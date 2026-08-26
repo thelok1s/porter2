@@ -79,6 +79,11 @@ const PorterConfig: Config = {
     // Needs a browser-session jar at db/vkcookies.txt (see .env.example);
     // without one, renewal reports "no-jar" and alerting takes over as before.
     renewAheadHours: 18,
+    // Only page SUPER_ADMIN_ID once renewal has failed 3 times running. The
+    // short-lived web_token regime blips transiently every so often and self-
+    // heals on the next tick; a run of failures is the real "renewal is stuck"
+    // signal worth a message.
+    alertAfterFailures: 3,
   },
 
   // Operator status readout. Off by default — it reports on live credentials

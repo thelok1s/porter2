@@ -129,6 +129,19 @@ export interface Config {
      * route has only ever been observed accepting a live token.
      */
     renewAheadHours?: number;
+    /**
+     * Page SUPER_ADMIN_ID only after unattended renewal has failed this many
+     * times in a row. Default 3.
+     *
+     * web_token mints live only ~15 min, so the watch re-mints every few
+     * minutes and an occasional attempt hits a transient VK blip (a 502, a
+     * momentary Code 5) that the very next attempt heals. Paging on a single
+     * miss would ring the operator for something already fixed. Only a run of
+     * consecutive failures means automation has genuinely stopped keeping up —
+     * a dead jar, a moved egress IP, VK down — and needs a human. A single
+     * success resets the count.
+     */
+    alertAfterFailures?: number;
   };
 
   health?: {

@@ -63,6 +63,25 @@ const MIN_RENEW_GAP_MS = 90_000;
 const MIN_TICK_MS = 45_000;
 
 /**
+ * Retry cadence while the token is DEAD — first retry this far out, doubling
+ * per consecutive failure up to EXPIRED_RETRY_CEILING_MS.
+ *
+ * A dead token means every post is silently losing its photo, so this is the
+ * moment to look MOST often. The pre-2026-08-26 code did the opposite: with no
+ * positive `remainingHours` to scale from, nextDelayMs fell back to the 30-min
+ * base, so an expired token that failed one renewal sat dead for half an hour
+ * before the next attempt. Measured in prod that day: failures at 02:30, 03:00,
+ * 03:30, 04:00 — four thirty-minute gaps, two hours of photo-less posts, and
+ * the eventual recovery at 04:30 was the same jar that had been fine all along.
+ *
+ * Backoff still applies, because "retry until it works" against a genuinely
+ * dead jar must not become an unbounded hammer on VK's login endpoint. The
+ * ceiling stays well under the healthy-token cadence: persistence is the point.
+ */
+const EXPIRED_RETRY_BASE_MS = 60_000;
+const EXPIRED_RETRY_CEILING_MS = 5 * 60_000;
+
+/**
  * When VK reports no expiry, warn on age instead.
  *
  * Every token measured so far has lasted 24 h, so a token past this age is
@@ -85,6 +104,50 @@ let announced: Severity | null = null;
 
 /** When the last renewal was attempted — the rate limit against a dead jar. */
 let lastRenewAttempt = 0;
+
+/**
+ * How many unattended renewals have failed in a row. Reset to zero the moment
+ * one succeeds. The operator is paged only once this crosses alertAfterFailures
+ * — the difference between a transient VK blip (heals next tick) and automation
+ * that has genuinely stopped keeping up.
+ */
+let consecutiveRenewalFailures = 0;
+
+/**
+ * Whether the current trouble has already been escalated to SUPER_ADMIN_ID.
+ * Keeps a stuck episode to a single page, and gates whether recovery is worth
+ * an all-clear: a dip nobody was paged about recovers quietly.
+ */
+let pagedFailure = false;
+
+/** Consecutive renewal failures before the operator is paged. */
+function alertAfterFailures(): number {
+  const configured = config.vkToken?.alertAfterFailures;
+  return Number.isFinite(configured) && (configured as number) > 0
+    ? Math.floor(configured as number)
+    : 3;
+}
+
+/**
+ * Whether the held token is past its reported expiry — i.e. whether photos are
+ * dropping off posts right now. A token with no reported expiry is NOT counted
+ * here: its state is a guess from age, not a fact, and a guess should not drive
+ * the aggressive cadence.
+ */
+function isDead(info: VkUserTokenInfo): boolean {
+  return info.present && info.remainingHours !== null && info.remainingHours <= 0;
+}
+
+/**
+ * How long to wait before the next attempt while the token is dead: doubling
+ * from EXPIRED_RETRY_BASE_MS per consecutive failure, capped. Bounded backoff
+ * rather than a fixed floor, so a jar that is genuinely dead is retried
+ * forever without hammering (~1, 2, 4, 5, 5, 5 … minutes).
+ */
+function expiredRetryDelayMs(): number {
+  const doublings = Math.min(Math.max(consecutiveRenewalFailures - 1, 0), 10);
+  return Math.min(EXPIRED_RETRY_CEILING_MS, EXPIRED_RETRY_BASE_MS * 2 ** doublings);
+}
 
 /**
  * The lifetime VK gave the held token, in hours — remaining plus age. The
@@ -153,6 +216,10 @@ function renewalDue(info: VkUserTokenInfo): boolean {
  * feel this floor, because a success replaces the token outright.
  */
 function renewGapMs(info: VkUserTokenInfo): number {
+  // A dead token is already costing photos on every post. The anti-hammer floor
+  // drops to the retry cadence so "keep trying until it works" is not silently
+  // throttled by a gap sized for a token that still functions.
+  if (isDead(info)) return expiredRetryDelayMs();
   const lifetime = observedLifetimeHours(info);
   if (lifetime === null) return MAX_RENEW_GAP_MINUTES * 60_000;
   return Math.min(
@@ -171,7 +238,11 @@ function renewGapMs(info: VkUserTokenInfo): number {
 function nextDelayMs(): number {
   const base =
     (config.vkToken?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES) * 60_000;
-  const { remainingHours } = vkUserTokenInfo();
+  const info = vkUserTokenInfo();
+  // Dead token: come back on the retry cadence, not the idle one. This is the
+  // case the old code got backwards (see EXPIRED_RETRY_BASE_MS).
+  if (isDead(info)) return expiredRetryDelayMs();
+  const { remainingHours } = info;
   if (remainingHours === null || remainingHours <= 0) return base;
   return Math.max(MIN_TICK_MS, Math.min(base, (remainingHours * 3_600_000) / 4));
 }
@@ -249,17 +320,53 @@ export function vkTokenStatus(): { severity: VkTokenSeverity; detail: string } {
   return classify();
 }
 
-async function notify(
-  severity: Severity,
-  detail: string,
-  renewalContext = "",
-): Promise<void> {
+/** Deliver one operator message to every configured super admin. */
+async function sendToSuperAdmins(text: string): Promise<void> {
   const ids = superAdminIds();
   if (ids.length === 0) {
     logger.warn("[vk-watch] no SUPER_ADMIN_ID set — cannot send the alert");
     return;
   }
+  for (const id of ids) {
+    try {
+      await bot.api.sendMessage(id, text, { parse_mode: "HTML" });
+    } catch (error) {
+      logger.error(`[vk-watch] could not alert ${id}: ${String(error)}`);
+    }
+  }
+}
 
+/**
+ * The all-clear, sent ONLY to close a page that actually went out.
+ *
+ * An operator who was told photos are dropping needs to be told when they stop
+ * dropping — otherwise the only way to learn the incident ended is to go and
+ * run /health, and a red message with no green after it trains people to
+ * distrust the channel. Never sent on its own: a dip nobody was paged about
+ * recovers silently (see tick).
+ */
+async function notifyRecovered(detail: string, attempts: number): Promise<void> {
+  // `attempts` is the run of failures the winning renewal ended. Zero means no
+  // renewal of ours ran on the tick that found the token healthy — someone
+  // rotated it by hand, or the store changed underneath us. Claiming credit for
+  // that would be a lie, and a misleading one: it would tell an operator the
+  // automation recovered when in fact their own paste is what fixed it.
+  const how =
+    attempts > 0
+      ? `recovered automatically after ${attempts} failed attempt${attempts === 1 ? "" : "s"}`
+      : "the token is valid again";
+  const text =
+    "🟢 <b>VK user token renewed</b>\nPhotos are attaching again.\n" +
+    `<i>${detail}</i>\n<i>${how}</i>\n` +
+    "\nNo action needed. <code>/health</code> for the full picture.";
+  await sendToSuperAdmins(text);
+}
+
+async function notify(
+  severity: Severity,
+  detail: string,
+  renewalContext = "",
+): Promise<void> {
   const head =
     severity === "expired"
       ? "🔴 <b>VK user token expired</b>\nPosts are publishing without their photos."
@@ -278,56 +385,95 @@ async function notify(
     "(validated before anything is installed). Automatic renewal rides " +
     "<code>db/vkcookies.txt</code>; if the failure above names the jar, " +
     "re-exporting a logged-in vk.ru tab's cookies may restore it. Check with " +
-    "<code>/health</code>.";
+    "<code>/health</code>.\n\nRenewal keeps retrying on its own; you will get " +
+    "a green message if it recovers without you.";
 
-  for (const id of ids) {
-    try {
-      await bot.api.sendMessage(id, text, { parse_mode: "HTML" });
-    } catch (error) {
-      logger.error(`[vk-watch] could not alert ${id}: ${String(error)}`);
-    }
-  }
+  await sendToSuperAdmins(text);
 }
 
 async function tick(): Promise<void> {
   const info = vkUserTokenInfo();
 
-  // Renew BEFORE alerting. A success resets the clock so the alert below
-  // simply never fires; a failure becomes context on whatever warning follows.
+  // Renew BEFORE alerting. A success resets the failure count so the page below
+  // never fires; a failure adds to the run and becomes context on it.
   let renewalContext = "";
+  let failuresBeforeSuccess = 0;
   if (renewalDue(info) && Date.now() - lastRenewAttempt >= renewGapMs(info)) {
     lastRenewAttempt = Date.now();
     const result = await renewVkUserToken();
     if (result.ok) {
-      logger.info(
+      // Capture the run this success ended BEFORE clearing it — the all-clear
+      // reports how many attempts it took, and the counter is about to go.
+      failuresBeforeSuccess = consecutiveRenewalFailures;
+      consecutiveRenewalFailures = 0;
+      // The routine case — the watch mints short-lived grants every few
+      // minutes. At debug so it does not bury the log; failures stay at warn.
+      logger.debug(
         `[vk-watch] auto-renewal succeeded (via ${result.via ?? "?"}, valid ` +
           `${result.expiresInHours !== null ? `${result.expiresInHours.toFixed(1)} h` : "for an unknown time"})`,
       );
     } else {
+      consecutiveRenewalFailures += 1;
       renewalContext = `auto-renewal unavailable — ${result.detail}`;
-      logger.warn(`[vk-watch] ${renewalContext}`);
+      // A failed renew effort is shown — the operator asked to see these — but
+      // one miss is expected against the flaky short-lived exchange, so the
+      // count travels with it to show whether it is a blip or a real run.
+      logger.warn(
+        `[vk-watch] ${renewalContext} (${consecutiveRenewalFailures}× in a row)`,
+      );
     }
   }
 
   const { severity, detail } = classify();
 
   if (severity === "ok") {
-    // Announce recovery only if a warning was actually sent, so a healthy boot
-    // does not open with an all-clear for a problem nobody heard about.
-    if (announced && announced !== "ok") {
-      logger.info(`[vk-watch] token healthy again — ${detail}`);
-    }
+    // A healthy token means any earlier run of failures is history — including
+    // one ended by an operator's manual rotation in another process, whose
+    // count would otherwise linger in memory and page on the very next single
+    // miss. The counter measures "renewal has stopped keeping the token
+    // healthy", so a healthy token zeroes it by definition.
+    consecutiveRenewalFailures = 0;
+
+    // Announce recovery only if the operator was actually paged, so a healthy
+    // boot — or a transient dip nobody heard about — does not open with an
+    // all-clear for a problem that never reached anyone.
+    const wasPaged = pagedFailure;
+    const wasWarning = announced !== null && announced !== "ok";
+    pagedFailure = false;
     announced = "ok";
+
+    if (wasPaged) {
+      logger.info(`[vk-watch] token healthy again — ${detail}`);
+      await notifyRecovered(detail, failuresBeforeSuccess);
+    } else if (wasWarning || failuresBeforeSuccess > 0) {
+      logger.debug(`[vk-watch] token recovered — ${detail}`);
+    }
     return;
   }
 
-  if (announced === severity) return;
+  // Non-ok severity. Page SUPER_ADMIN_ID only when renewal has failed
+  // COMPLETELY — a run of consecutive failures, not a single self-healing blip.
+  // A short-lived token dipping below the warn line while renewal is still
+  // keeping up is normal operation, so it is logged at debug and never paged.
+  const renewalGaveUp = consecutiveRenewalFailures >= alertAfterFailures();
+  const changed = announced !== severity;
   announced = severity;
 
-  logger.warn(
-    `[vk-watch] ${severity} — ${detail}${renewalContext ? `; ${renewalContext}` : ""}`,
-  );
-  await notify(severity, detail, renewalContext);
+  if (renewalGaveUp) {
+    if (changed) {
+      logger.warn(
+        `[vk-watch] ${severity} — ${detail}${renewalContext ? `; ${renewalContext}` : ""}`,
+      );
+    }
+    if (!pagedFailure) {
+      pagedFailure = true;
+      await notify(severity, detail, renewalContext);
+    }
+  } else if (changed) {
+    logger.debug(
+      `[vk-watch] ${severity} — ${detail} (renewal still recovering, not paging)`,
+    );
+  }
 }
 
 export function startVkTokenWatch(): void {

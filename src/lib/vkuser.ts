@@ -167,10 +167,19 @@ export function saveVkUserToken(
   const previous = resolve();
   if (previous) {
     const lived = (Date.now() - Date.parse(previous.obtainedAt)) / 3_600_000;
-    logger.info(
+    const line =
       `[vk] token replaced (${previous.source} → ${source}). The outgoing one ` +
-        `lived ${lived.toFixed(1)} h.`,
-    );
+      `lived ${lived.toFixed(1)} h.`;
+    // A renewal→renewal swap is routine bookkeeping: the watchdog re-mints
+    // short-lived web_token grants every few minutes, and this line at info
+    // would drown the log. It belongs at debug. A change of SOURCE
+    // (env/manual → renewal, or a hand install) is an operator-visible event
+    // worth keeping at info.
+    if (previous.source === "renewal" && source === "renewal") {
+      logger.debug(line);
+    } else {
+      logger.info(line);
+    }
   }
   writeStore({
     token,
