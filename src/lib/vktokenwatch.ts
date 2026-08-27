@@ -106,6 +106,19 @@ let announced: Severity | null = null;
 let lastRenewAttempt = 0;
 
 /**
+ * Earliest time renewal may be attempted again, set when VK answers 429.
+ *
+ * Our own cadence is the thing that earned the 429, so continuing on it would
+ * extend the block rather than ride it out. A dead token for a few minutes is
+ * cheaper than an escalating ban on the endpoint that is the only way to fix
+ * it. Zero means no cooldown in force.
+ */
+let rateLimitedUntil = 0;
+
+/** How long to stand down after VK says 429. */
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60_000;
+
+/**
  * How many unattended renewals have failed in a row. Reset to zero the moment
  * one succeeds. The operator is paged only once this crosses alertAfterFailures
  * — the difference between a transient VK blip (heals next tick) and automation
@@ -239,6 +252,10 @@ function nextDelayMs(): number {
   const base =
     (config.vkToken?.intervalMinutes ?? DEFAULT_INTERVAL_MINUTES) * 60_000;
   const info = vkUserTokenInfo();
+  // Standing down after a 429: sleep until the cooldown lifts rather than
+  // waking every minute to find the gate still shut.
+  const cooldownLeft = rateLimitedUntil - Date.now();
+  if (cooldownLeft > 0) return Math.min(base, Math.max(MIN_TICK_MS, cooldownLeft));
   // Dead token: come back on the retry cadence, not the idle one. This is the
   // case the old code got backwards (see EXPIRED_RETRY_BASE_MS).
   if (isDead(info)) return expiredRetryDelayMs();
@@ -320,7 +337,29 @@ export function vkTokenStatus(): { severity: VkTokenSeverity; detail: string } {
   return classify();
 }
 
-/** Deliver one operator message to every configured super admin. */
+/**
+ * Make VK's own words safe to drop into an HTML-parsed Telegram message.
+ *
+ * Measured 2026-08-27: VK's edge answered a rate-limited exchange with an nginx
+ * `<html>` error page, that markup travelled into the alert as failure detail,
+ * and Telegram rejected the whole message with "Unsupported start tag". The one
+ * alert that mattered — renewal genuinely stuck — was the one that never
+ * arrived. Anything quoted from VK is escaped from here on.
+ */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Deliver one operator message to every configured super admin.
+ *
+ * Falls back to an unparsed send if Telegram rejects the markup. Escaping above
+ * should make that impossible, but this is the channel that reports the service
+ * is broken: it must not be the thing that breaks. A mangled alert beats none.
+ */
 async function sendToSuperAdmins(text: string): Promise<void> {
   const ids = superAdminIds();
   if (ids.length === 0) {
@@ -331,7 +370,20 @@ async function sendToSuperAdmins(text: string): Promise<void> {
     try {
       await bot.api.sendMessage(id, text, { parse_mode: "HTML" });
     } catch (error) {
-      logger.error(`[vk-watch] could not alert ${id}: ${String(error)}`);
+      const failedToParse = /can't parse entities/i.test(String(error));
+      if (!failedToParse) {
+        logger.error(`[vk-watch] could not alert ${id}: ${String(error)}`);
+        continue;
+      }
+      try {
+        // Strip the tags rather than send them as literal text.
+        await bot.api.sendMessage(id, text.replace(/<[^>]+>/g, ""));
+        logger.warn(
+          `[vk-watch] alert to ${id} had unparseable markup; sent as plain text`,
+        );
+      } catch (retryError) {
+        logger.error(`[vk-watch] could not alert ${id}: ${String(retryError)}`);
+      }
     }
   }
 }
@@ -357,7 +409,7 @@ async function notifyRecovered(detail: string, attempts: number): Promise<void> 
       : "the token is valid again";
   const text =
     "🟢 <b>VK user token renewed</b>\nPhotos are attaching again.\n" +
-    `<i>${detail}</i>\n<i>${how}</i>\n` +
+    `<i>${escapeHtml(detail)}</i>\n<i>${how}</i>\n` +
     "\nNo action needed. <code>/health</code> for the full picture.";
   await sendToSuperAdmins(text);
 }
@@ -376,9 +428,11 @@ async function notify(
   // the unattended mint outright even against a complete cookie jar, so jar
   // advice only makes sense when the failure reason says the JAR was the
   // problem. /health confirms recovery either way.
+  // Both carry text VK wrote — the renewal context especially, which quotes the
+  // endpoint's answer verbatim. Escape before it reaches the parser.
   const text =
-    `${head}\n<i>${detail}</i>\n` +
-    (renewalContext ? `<i>${renewalContext}</i>\n` : "") +
+    `${head}\n<i>${escapeHtml(detail)}</i>\n` +
+    (renewalContext ? `<i>${escapeHtml(renewalContext)}</i>\n` : "") +
     "\nFix: open the Mini App page inside VK as an admin → Request access → " +
     "Reveal token, then\n<code>pbpaste | docker compose exec -T porter2 npm " +
     "run vkrenewprobe -- --install --stdin</code>\n" +
@@ -398,7 +452,12 @@ async function tick(): Promise<void> {
   // never fires; a failure adds to the run and becomes context on it.
   let renewalContext = "";
   let failuresBeforeSuccess = 0;
-  if (renewalDue(info) && Date.now() - lastRenewAttempt >= renewGapMs(info)) {
+  const coolingDown = Date.now() < rateLimitedUntil;
+  if (
+    renewalDue(info) &&
+    !coolingDown &&
+    Date.now() - lastRenewAttempt >= renewGapMs(info)
+  ) {
     lastRenewAttempt = Date.now();
     const result = await renewVkUserToken();
     if (result.ok) {
@@ -406,6 +465,7 @@ async function tick(): Promise<void> {
       // reports how many attempts it took, and the counter is about to go.
       failuresBeforeSuccess = consecutiveRenewalFailures;
       consecutiveRenewalFailures = 0;
+      rateLimitedUntil = 0;
       // The routine case — the watch mints short-lived grants every few
       // minutes. At debug so it does not bury the log; failures stay at warn.
       logger.debug(
@@ -414,6 +474,13 @@ async function tick(): Promise<void> {
       );
     } else {
       consecutiveRenewalFailures += 1;
+      if (result.rateLimited) {
+        rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+        logger.warn(
+          `[vk-watch] VK is rate-limiting the exchange — standing down for ` +
+            `${RATE_LIMIT_COOLDOWN_MS / 60_000} min`,
+        );
+      }
       renewalContext = `auto-renewal unavailable — ${result.detail}`;
       // A failed renew effort is shown — the operator asked to see these — but
       // one miss is expected against the flaky short-lived exchange, so the

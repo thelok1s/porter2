@@ -251,9 +251,37 @@ export function mergeSetCookies(header: string, setCookies: string[]): string {
   return [...map].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+/**
+ * Condense an error body to something worth reading.
+ *
+ * VK's edge answers a rate-limited exchange with an nginx HTML page. Quoting
+ * 160 characters of that markup buries the one useful word in a wall of tags —
+ * and, measured 2026-08-27, breaks the Telegram alert it later travels into.
+ * The `<title>` is the whole message; take it and drop the rest.
+ */
+function summariseBody(text: string): string {
+  const redacted = redactForLogs(text).trim();
+  if (/^<(?:!doctype|html)/i.test(redacted)) {
+    const title = redacted.match(/<title>([^<]*)<\/title>/i)?.[1]?.trim();
+    return title || "(HTML error page)";
+  }
+  return redacted.replace(/\s+/g, " ").slice(0, 160);
+}
+
 type Attempt =
   | { kind: "minted"; grant: WebTokenGrant }
-  | { kind: "refused"; reason: "http" | "bad-envelope"; detail: string };
+  | {
+      kind: "refused";
+      reason: "http" | "bad-envelope";
+      detail: string;
+      /**
+       * The endpoint or the network was unavailable, as opposed to the request
+       * being wrong. Nothing about trying a DIFFERENT app id or body shape
+       * addresses a timeout or a 429, so the caller stops the sweep instead of
+       * burning three more requests (and 45 more seconds) on the same outage.
+       */
+      transient?: boolean;
+    };
 
 /**
  * One wire round-trip against the exchange. Exported so the operator tool
@@ -296,11 +324,15 @@ export async function postWebToken(
   const text = await res.text();
 
   if (res.status !== 200) {
+    // 429 says "you are asking too often" and 5xx says "not now" — both are
+    // about the SERVER, so no other app id or body shape will fare better.
+    const transient = res.status === 429 || res.status >= 500;
     return {
       attempt: {
         kind: "refused",
         reason: "http",
-        detail: `HTTP ${res.status}: ${redactForLogs(text).replace(/\s+/g, " ").slice(0, 160)}`,
+        detail: `HTTP ${res.status}: ${summariseBody(text)}`,
+        transient,
       },
       jarHeader: nextJar,
     };
@@ -314,7 +346,7 @@ export async function postWebToken(
       attempt: {
         kind: "refused",
         reason: "bad-envelope",
-        detail: `non-JSON answer: ${redactForLogs(text).replace(/\s+/g, " ").slice(0, 160)}`,
+        detail: `non-JSON answer: ${summariseBody(text)}`,
       },
       jarHeader: nextJar,
     };
@@ -377,6 +409,12 @@ export interface VkRenewResult {
   expiresInHours: number | null;
   /** How the installed token was obtained — e.g. "web_token app 54703482". */
   via: string | null;
+  /**
+   * VK answered 429. The caller must wait materially longer than its usual
+   * cadence before asking again — retrying on the normal schedule is what
+   * earned the 429 in the first place, and keeping it up extends the block.
+   */
+  rateLimited?: boolean;
 }
 
 let inflight: Promise<VkRenewResult> | null = null;
@@ -484,7 +522,17 @@ async function runRenewal(): Promise<VkRenewResult> {
     }
   };
 
-  for (const appId of candidates) {
+  // Set when the endpoint itself was unavailable rather than unwilling. Such a
+  // failure stops the sweep AND skips the harvest below: neither a different
+  // app id nor a jar-carried token addresses a network that is not answering,
+  // and every extra request is one more against the rate limit that is often
+  // the very thing refusing us. Measured 2026-08-27: a single timeout still
+  // drove all four app-id/body combinations plus four harvest validations —
+  // ~150 requests an hour against login.vk.ru, which VK answered with 429.
+  let unreachable = false;
+  let rateLimited = false;
+
+  outer: for (const appId of candidates) {
     for (const bodyToken of [null, current]) {
       let result: { attempt: Attempt; jarHeader: string };
       try {
@@ -494,10 +542,12 @@ async function runRenewal(): Promise<VkRenewResult> {
         failure = {
           reason: "http",
           detail: timedOut
-            ? `timed out after ${REQUEST_TIMEOUT_MS} ms`
-            : String(error).slice(0, 160),
+            ? `timed out after ${REQUEST_TIMEOUT_MS} ms (app ${appId})`
+            : `${String(error).slice(0, 160)} (app ${appId})`,
         };
-        continue;
+        // A timeout is the network, not the request. Stop.
+        unreachable = true;
+        break outer;
       }
       jarHeader = result.jarHeader;
 
@@ -507,6 +557,11 @@ async function runRenewal(): Promise<VkRenewResult> {
           reason: attempt.reason,
           detail: `${attempt.detail} (app ${appId}${bodyToken ? ", token-in-body" : ""})`,
         };
+        if (attempt.transient) {
+          unreachable = true;
+          rateLimited = attempt.detail.startsWith("HTTP 429");
+          break outer;
+        }
         continue;
       }
 
@@ -535,7 +590,9 @@ async function runRenewal(): Promise<VkRenewResult> {
   const primaryFailure = failure;
 
   // Last resort before giving up: the jar itself may carry a usable token.
-  for (const candidate of harvestJarTokens(jarHeader)) {
+  // Skipped when the endpoint was unreachable — these validations are four more
+  // VK calls that cannot possibly help with an outage or a rate limit.
+  for (const candidate of unreachable ? [] : harvestJarTokens(jarHeader)) {
     const verdict = await uploadRouteWorks(candidate);
     if (!verdict.ok) {
       // A dead carrier is the norm, not news — keep it out of the headline and
@@ -552,5 +609,5 @@ async function runRenewal(): Promise<VkRenewResult> {
   logger.warn(
     `[vk-renew] renewal failed — ${primaryFailure.reason}: ${primaryFailure.detail}${jarNote}`,
   );
-  return { ...none, ...primaryFailure };
+  return { ...none, ...primaryFailure, rateLimited };
 }
