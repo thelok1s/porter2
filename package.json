@@ -10,16 +10,17 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "start:bun": "bun src/main.ts",
-    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "init": "tsx src/scripts/initdb.ts",
-    "mtlogin": "tsx src/scripts/mtlogin.ts",
     "prune": "tsx src/scripts/prunedb.ts",
-    "vkprobe": "tsx src/scripts/vkphotoprobe.ts",
+    "vkrenew": "tsx src/scripts/vkrenewnow.ts",
+    "vkrenewprobe": "tsx src/scripts/vkrenewprobe.ts",
     "vkuserprobe": "tsx src/scripts/vkuserprobe.ts",
-    "tunnel": "npx localtunnel --port 3000 --subdomain fuzzy-dog-59",
-    "vkrenewprobe": "tsx src/scripts/vkrenewprobe.ts"
+    "vkphotoprobe": "tsx src/scripts/vkphotoprobe.ts",
+    "mtlogin": "tsx src/scripts/mtlogin.ts",
+    "flushlogs": "tsx src/scripts/flushlogs.ts",
+    "tunnel": "npx localtunnel --port 5050"
   },
   "dependencies": {
     "@mtcute/bun": "^0.31.0",

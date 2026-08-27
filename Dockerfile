@@ -48,6 +48,10 @@ ENV NODE_ENV=production
 # Express listen port (porter.config.ts default is 5050). Set PORTER_API_PORT in
 # .env to override — must match the port published in docker-compose.yml.
 ENV PORTER_API_PORT=5050
+# Lets operator scripts tell "inside porter" from "on somebody's laptop". VK
+# user tokens are IP-bound, so `npm run vkrenew` must refuse to mint one from
+# anywhere but the host porter actually calls VK from (src/scripts/vkrenewnow.ts).
+ENV PORTER_IN_CONTAINER=1
 
 EXPOSE 5050
 CMD ["node_modules/.bin/tsx", "src/main.ts"]

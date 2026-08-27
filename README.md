@@ -113,6 +113,39 @@ npm start                  # tsx src/main.ts   (or: npm run start:bun)
 Required env: `VK_TOKEN`, `TELEGRAM_TOKEN`, `TELEGRAM_CHANNEL_ID`,
 `TELEGRAM_CHANNEL_PUBLIC_LINK`, `TELEGRAM_CHAT_ID`.
 
+### Scripts
+
+```bash
+npm start            # run (tsx; resolves the @/* path aliases tsc would not)
+npm run start:bun    # same, under Bun
+npm run typecheck    # tsc --noEmit
+npm run lint         # eslint .
+
+npm run init         # create SQLite tables
+npm run prune        # drop old rows
+npm run flushlogs    # empty logs/ (-t app|error|debug for just one)
+npm run mtlogin      # print an MTPROTO_SESSION string
+```
+
+VK user token — the credential that lets posts carry a photo. It expires on
+its own schedule and the watchdog renews it unattended; these are for when you
+need to intervene. **All of them belong inside the container**, because these
+tokens are bound to the IP they were minted from:
+
+```bash
+docker compose exec porter2 npm run vkrenew        # renew NOW, off-schedule
+docker compose exec porter2 npm run vkrenewprobe   # why is renewal failing?
+docker compose exec porter2 npm run vkrenewprobe -- --sweep   # longer-lived token?
+docker compose exec porter2 npm run vkuserprobe    # can the held token upload?
+docker compose exec porter2 npm run vkphotoprobe   # exercise the photo routes
+```
+
+`vkrenew` refuses to run outside the container for that IP reason — a token
+minted on a laptop answers Code 5 from the server and every post silently
+loses its picture. Set `PORTER_ALLOW_HOST_RENEW=1` only if porter itself runs
+on that host rather than in Docker. To paste a long-lived token in by hand,
+see `VK_USER_TOKEN` in `.env.example`.
+
 ### MTProto (optional)
 
 The Bot API has no way to list a chat's members — `getChatAdministrators` is
