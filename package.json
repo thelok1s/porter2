@@ -19,8 +19,7 @@
     "vkuserprobe": "tsx src/scripts/vkuserprobe.ts",
     "vkphotoprobe": "tsx src/scripts/vkphotoprobe.ts",
     "mtlogin": "tsx src/scripts/mtlogin.ts",
-    "flushlogs": "tsx src/scripts/flushlogs.ts",
-    "tunnel": "npx localtunnel --port 5050"
+    "flushlogs": "tsx src/scripts/flushlogs.ts"
   },
   "dependencies": {
     "@mtcute/bun": "^0.31.0",
