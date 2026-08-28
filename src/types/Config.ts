@@ -159,37 +159,6 @@ export interface Config {
 }
 
 /**
- * Helper type to check if API is enabled
- */
-export type ApiEnabledConfig = Config & {
-  api: Extract<Config["api"], { enabled: true }>;
-};
-
-/**
- * Helper type to check if submissions are enabled
- */
-export type SubmissionsEnabledConfig = ApiEnabledConfig & {
-  api: ApiEnabledConfig["api"] & {
-    submissions: Extract<
-      NonNullable<ApiEnabledConfig["api"]["submissions"]>,
-      { enabled: true }
-    >;
-  };
-};
-
-/**
- * Helper type to check if image server is enabled
- */
-export type ImageServerEnabledConfig = ApiEnabledConfig & {
-  api: ApiEnabledConfig["api"] & {
-    imageServer: Extract<
-      NonNullable<ApiEnabledConfig["api"]["imageServer"]>,
-      { enabled: true }
-    >;
-  };
-};
-
-/**
  * Validate port number
  */
 export function isValidPort(port: number): boolean {

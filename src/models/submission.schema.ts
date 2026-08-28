@@ -8,11 +8,25 @@ import {
 import { sequelize } from "@/lib/sequelize";
 
 /**
- * Submission status enum
+ * Submission status enum.
+ *
+ * This list IS the database schema: `Submission.init` builds the column as
+ * `ENUM(...Object.values(SubmissionStatus))`, so removing a member is a
+ * migration, not a code cleanup.
+ *
+ * `APPROVED` and `MANUAL` are therefore kept although nothing assigns them any
+ * more. `MANUAL` was set only by `POST /:id/manual`, removed once moderation
+ * moved into the Mini App and nothing was left calling it; `APPROVED` has been
+ * unassigned for longer — the approve route writes `PUBLISHED` directly. Rows
+ * written before those changes can still hold either value, and the readers
+ * that matter treat anything other than `PENDING` as closed, so old rows keep
+ * behaving correctly.
  */
 export enum SubmissionStatus {
   PENDING = "pending",
+  /** Legacy — never assigned; see the note above. */
   APPROVED = "approved",
+  /** Legacy — never assigned; see the note above. */
   MANUAL = "manual",
   DECLINED = "declined",
   SCHEDULED = "scheduled",
