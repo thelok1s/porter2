@@ -48,6 +48,12 @@ ENV NODE_ENV=production
 # Express listen port (porter.config.ts default is 5050). Set PORTER_API_PORT in
 # .env to override — must match the port published in docker-compose.yml.
 ENV PORTER_API_PORT=5050
+# The club schedules in Moscow time and every date the bot renders is read by
+# someone in it. node:22-bookworm-slim is UTC, so without this a scheduled-post
+# confirmation told the author a time three hours early (measured 2026-08-28).
+# Call sites still pass timeZone explicitly — this is the safety net, so a new
+# toLocaleString that forgets to is right anyway.
+ENV TZ=Europe/Moscow
 # Lets operator scripts tell "inside porter" from "on somebody's laptop". VK
 # user tokens are IP-bound, so `npm run vkrenew` must refuse to mint one from
 # anywhere but the host porter actually calls VK from (src/scripts/vkrenewnow.ts).
