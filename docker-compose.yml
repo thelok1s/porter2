@@ -47,6 +47,10 @@ services:
       # nothing at all, which matters more than it sounds: the routine VK
       # renewal detail is deliberately logged at debug to keep `docker logs`
       # readable, and debug.log is the only place it was supposed to survive.
+      # Like ./data above, this bind mount inherits the HOST directory's
+      # ownership — a root-owned logs/ leaves the container user unable to open
+      # the files. The logger now drops those destinations and says so instead
+      # of dying, but you get stdout only until this is run:
       #   sudo mkdir -p logs && sudo chown -R 1001:1001 logs
       - ./logs:/app/logs
     healthcheck:
