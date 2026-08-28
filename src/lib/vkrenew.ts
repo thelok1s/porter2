@@ -268,6 +268,60 @@ function summariseBody(text: string): string {
   return redacted.replace(/\s+/g, " ").slice(0, 160);
 }
 
+/**
+ * Prefixes that reach VK by the DIRECT route on the porter host.
+ *
+ * The deployment sends most traffic through a VPN whose exit IP rotates in a
+ * shared NL pool, and excludes VK by destination prefix so the IP-bound user
+ * token keeps working (see .env.example, VK_USER_TOKEN). A VK address outside
+ * these prefixes therefore leaves through the VPN — from an address shared with
+ * strangers, which VK's edge rate-limits on their behaviour rather than ours.
+ *
+ * That is the hypothesis this diagnostic exists to confirm or kill: a 429 at
+ * five requests an hour (measured 2026-08-28) is not a rate we produced.
+ */
+const DIRECT_ROUTE_PREFIXES: [string, number][] = [
+  ["87.240.128.0", 18],
+  ["93.186.224.0", 20],
+  ["95.213.0.0", 18],
+];
+
+function inPrefix(ip: string, network: string, bits: number): boolean {
+  const toInt = (a: string): number =>
+    a.split(".").reduce((acc, o) => (acc << 8) + Number(o), 0) >>> 0;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (toInt(ip) & mask) === (toInt(network) & mask);
+}
+
+/**
+ * On a rate-limit, say which addresses the endpoint resolves to and whether any
+ * of them would take the VPN. Runs only on 429, so it costs nothing normally.
+ *
+ * Deliberately reports rather than concludes: this process cannot see the host's
+ * nft ruleset, so it states the routing fact and leaves the judgement to whoever
+ * can check `nft list ruleset`.
+ */
+async function reportRouting(): Promise<void> {
+  try {
+    const { lookup } = await import("dns/promises");
+    const host = new URL(ENDPOINT).hostname;
+    const addrs = await lookup(host, { all: true, family: 4 });
+    const notes = addrs.map(({ address }) => {
+      const direct = DIRECT_ROUTE_PREFIXES.some(([n, b]) => inPrefix(address, n, b));
+      return `${address} ${direct ? "direct" : "VIA VPN — shared exit IP"}`;
+    });
+    logger.warn(
+      `[vk-renew] rate-limited; ${host} resolves to: ${notes.join(", ")}. ` +
+        "A VPN exit is shared with strangers and gets rate-limited on their " +
+        "traffic, not ours — check the VK prefixes in /etc/dockervpn.nft are " +
+        "still loaded (nft list ruleset), and remember the selector needs " +
+        "`systemctl restart docker-vpn-selector` after any re-init.",
+    );
+  } catch (error) {
+    logger.debug(`[vk-renew] routing check failed: ${String(error).slice(0, 120)}`);
+  }
+}
+
 type Attempt =
   | { kind: "minted"; grant: WebTokenGrant }
   | {
@@ -560,6 +614,7 @@ async function runRenewal(): Promise<VkRenewResult> {
         if (attempt.transient) {
           unreachable = true;
           rateLimited = attempt.detail.startsWith("HTTP 429");
+          if (rateLimited) await reportRouting();
           break outer;
         }
         continue;
@@ -606,7 +661,10 @@ async function runRenewal(): Promise<VkRenewResult> {
     return await install(candidate, null, "harvested from jar");
   }
 
-  logger.warn(
+  // Debug, not warn: every caller reports this failure in its own words — the
+  // watchdog as one consolidated line, `npm run vkrenew` on stdout — and three
+  // warnings for one failed exchange trained the eye to skip all of them.
+  logger.debug(
     `[vk-renew] renewal failed — ${primaryFailure.reason}: ${primaryFailure.detail}${jarNote}`,
   );
   return { ...none, ...primaryFailure, rateLimited };

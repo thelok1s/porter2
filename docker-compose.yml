@@ -39,6 +39,16 @@ services:
       # container user before the first start or the image store is read-only:
       #   sudo mkdir -p data/images && sudo chown -R 1001:1001 data
       - ./data:/app/data
+      # Log files. src/lib/logger.ts writes app.log, error.log and debug.log to
+      # ./logs relative to the working directory, which inside the container is
+      # /app/logs — unmounted, they were being written into the container layer
+      # and thrown away on every rebuild, while the host's ./logs kept whatever
+      # the pre-Docker run had left there. `cat logs/debug.log` therefore showed
+      # nothing at all, which matters more than it sounds: the routine VK
+      # renewal detail is deliberately logged at debug to keep `docker logs`
+      # readable, and debug.log is the only place it was supposed to survive.
+      #   sudo mkdir -p logs && sudo chown -R 1001:1001 logs
+      - ./logs:/app/logs
     healthcheck:
       # /health is unauthenticated and returns JSON {status:"ok"}.
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5050/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

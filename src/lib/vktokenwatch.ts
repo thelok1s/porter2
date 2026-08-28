@@ -118,8 +118,10 @@ let lastRenewAttempt = 0;
  */
 let rateLimitedUntil = 0;
 
-/** How long to stand down after VK says 429. */
+/** First stand-down after VK says 429; doubles per consecutive refusal. */
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60_000;
+/** Ceiling on that backoff — beyond this it is an outage, not a rate limit. */
+const RATE_LIMIT_MAX_COOLDOWN_MS = 60 * 60_000;
 
 /**
  * How many unattended renewals have failed in a row. Reset to zero the moment
@@ -494,19 +496,26 @@ async function tick(): Promise<void> {
       );
     } else {
       consecutiveRenewalFailures += 1;
-      if (result.rateLimited) {
-        rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-        logger.warn(
-          `[vk-watch] VK is rate-limiting the exchange — standing down for ` +
-            `${RATE_LIMIT_COOLDOWN_MS / 60_000} min`,
-        );
-      }
       renewalContext = `auto-renewal unavailable — ${result.detail}`;
-      // A failed renew effort is shown — the operator asked to see these — but
-      // one miss is expected against the flaky short-lived exchange, so the
-      // count travels with it to show whether it is a blip or a real run.
+
+      // Repeated 429s mean the block outlasts our wait, so waiting the same ten
+      // minutes again just earns another one. Double the stand-down each time,
+      // capped — measured 2026-08-28: three consecutive 429s at ten-minute
+      // spacing, each attempt refused, at a request rate of about five an hour.
+      let standDown = "";
+      if (result.rateLimited) {
+        const cooldown = Math.min(
+          RATE_LIMIT_MAX_COOLDOWN_MS,
+          RATE_LIMIT_COOLDOWN_MS * 2 ** Math.min(consecutiveRenewalFailures - 1, 4),
+        );
+        rateLimitedUntil = Date.now() + cooldown;
+        standDown = `; standing down ${Math.round(cooldown / 60_000)} min`;
+      }
+
+      // ONE line per failed exchange. The count says whether this is a blip or
+      // a run; the stand-down says what happens next.
       logger.warn(
-        `[vk-watch] ${renewalContext} (${consecutiveRenewalFailures}× in a row)`,
+        `[vk-watch] ${renewalContext} (${consecutiveRenewalFailures}× in a row)${standDown}`,
       );
     }
   }
