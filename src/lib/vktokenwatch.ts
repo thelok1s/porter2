@@ -38,13 +38,16 @@ const DEFAULT_INTERVAL_MINUTES = 30;
 const DEFAULT_WARN_BEFORE_HOURS = 6;
 
 /**
- * Renew proactively once fewer than this many hours remain — about three
- * quarters through the measured 24 h life, so the swap happens while the old
- * token still works (the web_token exchange has only ever been observed with
- * a live token in the body).
+ * Upper bound on how early renewal may start, in hours remaining.
  *
- * For a SHORT-lived grant the same three-quarters rule applies
- * proportionally (see renewalDue); this constant only caps it.
+ * Only a cap: what normally decides is RENEW_AT_LIFE_FRACTION, proportional to
+ * the token's observed life. This binds only for a grant longer than three
+ * days, where a quarter of the life would be further out than 18 h.
+ *
+ * (The previous comment here described 18 h as "about three quarters through
+ * the measured 24 h life". It is one quarter through — 18 h REMAINING of 24 is
+ * 6 h elapsed. The same slip was in renewalDue, where it was not just wrong
+ * prose but the actual trigger; see RENEW_AT_LIFE_FRACTION.)
  */
 const DEFAULT_RENEW_AHEAD_HOURS = 18;
 
@@ -196,12 +199,26 @@ function warnBelowHours(info: VkUserTokenInfo): number {
 }
 
 /**
+ * Renew once only this fraction of the token's observed life is left — i.e.
+ * about three quarters of the way through it.
+ *
+ * The old value was 0.75, and its comment claimed the same thing while doing
+ * the opposite: `remaining <= 0.75 × lifetime` fires once a QUARTER of the life
+ * has gone, not three quarters. For a 15-minute grant that meant asking again
+ * at minute 6.6 — and since VK returns the token you already hold until it is
+ * nearly dead (see saveVkUserToken), the answer was the same token and the
+ * request bought nothing but rate-limit budget.
+ */
+const RENEW_AT_LIFE_FRACTION = 0.25;
+
+/**
  * Whether this token needs attention soon enough to try renewing it now.
  *
- * With a reported expiry the trigger is three quarters through the OBSERVED
- * life — capped by the configured ahead-hours so a long-lived token keeps the
- * tuned behaviour exactly (24 h × ¾ = the old 18 h). A fifteen-minute grant
- * therefore renews around its eleventh minute instead of dying on the floor.
+ * Late rather than early, deliberately. Asking before VK is willing to rotate
+ * returns the held token unchanged, so an early attempt is pure waste; what
+ * matters is leaving enough runway afterwards for a few retries, which a
+ * quarter of the life gives (≈3.7 min of a 15-minute grant, ≈6 h of a daily
+ * one). The configured ahead-hours still caps it.
  *
  * Without a reported expiry (a hand-pasted token carries no issue time VK
  * shares), age stands in against the same threshold — the measured 24 h life
@@ -214,7 +231,10 @@ function renewalDue(info: VkUserTokenInfo): boolean {
   if (info.remainingHours !== null) {
     const lifetime = observedLifetimeHours(info);
     if (lifetime !== null) {
-      return info.remainingHours <= Math.min(aheadHours, lifetime * 0.75);
+      return (
+        info.remainingHours <=
+        Math.min(aheadHours, lifetime * RENEW_AT_LIFE_FRACTION)
+      );
     }
     return info.remainingHours <= aheadHours;
   }

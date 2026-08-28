@@ -165,7 +165,25 @@ export function saveVkUserToken(
   source: TokenRecord["source"],
 ): void {
   const previous = resolve();
-  if (previous) {
+
+  // Asking the exchange early does NOT get you a new token: VK hands back the
+  // one you already hold, with less life left on it, and only rotates once it
+  // is nearly dead (measured 2026-08-28 — four separate fingerprints, each
+  // re-fetched 2-4× across its 15 min without changing).
+  //
+  // Treating that as an install corrupted the one number the whole watchdog is
+  // scaled from. `obtainedAt` is the basis for age, `observedLifetimeHours` is
+  // remaining + age, and resetting the clock on an UNCHANGED token made a
+  // 15-minute-old grant look newly issued — so the computed lifetime collapsed
+  // 0.3 h → 0.1 h → 0.0 h. Every interval here is proportional to that figure,
+  // so they all contracted together, polling accelerated, and VK answered 429.
+  // The observed cadence (0, 6.6, 10.3, 12.4, 13.9 min — identical in every
+  // run) is that spiral, reproduced to within 0.1 min by a model of this code.
+  //
+  // So: keep the original issue time when the token has not actually changed.
+  const unchanged = previous?.token === token;
+
+  if (previous && !unchanged) {
     const lived = (Date.now() - Date.parse(previous.obtainedAt)) / 3_600_000;
     const line =
       `[vk] token replaced (${previous.source} → ${source}). The outgoing one ` +
@@ -180,10 +198,16 @@ export function saveVkUserToken(
     } else {
       logger.info(line);
     }
+  } else if (unchanged) {
+    logger.debug(
+      "[vk] the exchange returned the token we already hold — keeping its " +
+        "original issue time so the measured lifetime stays honest",
+    );
   }
+
   writeStore({
     token,
-    obtainedAt: new Date().toISOString(),
+    obtainedAt: unchanged ? previous.obtainedAt : new Date().toISOString(),
     expiresAt: expiresInSeconds
       ? new Date(Date.now() + expiresInSeconds * 1000).toISOString()
       : null,
