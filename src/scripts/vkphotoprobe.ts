@@ -39,7 +39,7 @@ dotenv.config();
  *   bun src/scripts/vkphotoprobe.ts --url https://frog.prod…/api/images/x.png
  *
  * Report the printed summary — the winning strategy is what gets wired into
- * publishAnnouncementToVk.
+ * postToVkWall.
  */
 
 // ── args ────────────────────────────────────────────────────────────────────
