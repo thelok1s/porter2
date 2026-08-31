@@ -18,6 +18,8 @@
     "vkrenewprobe": "tsx src/scripts/vkrenewprobe.ts",
     "vkuserprobe": "tsx src/scripts/vkuserprobe.ts",
     "vkphotoprobe": "tsx src/scripts/vkphotoprobe.ts",
+    "rotationprobe": "tsx src/scripts/rotationprobe.ts",
+    "sweepprobe": "tsx src/scripts/sweepprobe.ts",
     "mtlogin": "tsx src/scripts/mtlogin.ts",
     "flushlogs": "tsx src/scripts/flushlogs.ts"
   },
