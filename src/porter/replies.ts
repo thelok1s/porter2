@@ -11,6 +11,7 @@ import type {
   DocumentAttachment,
 } from "vk-io";
 import { enqueuePendingComment } from "./pending-comments";
+import { TG_PORT_MARKER } from "./comments";
 import { formatMessageText, getHtmlLink, splitText } from "@/core/utils";
 
 const tgChatId = String(tgChatIdRaw ?? "");
@@ -144,6 +145,41 @@ async function recordReply(
   }
 }
 
+/**
+ * Is this comment one porter itself put on the wall a moment ago?
+ *
+ * When a Telegram comment is mirrored into VK, VK announces the new comment on
+ * the longpoll — and that announcement reaches us BEFORE `wall.createComment`
+ * has even returned the id we would have deduplicated it by. The mapping row is
+ * therefore never in place in time: the race is not tight, it is lost every
+ * time. In the one instance in the logs it looped on the first try.
+ *
+ * porter1 never showed this because it crashed instead. It resolved every
+ * commenter through `users.get`, which cannot resolve a community id, so its
+ * own echo threw a TypeError on `sender.id` and died inside the catch-all. Once
+ * porter2 taught `resolveSender` to handle community ids, the echo survived to
+ * be posted — the loop had been latent in both, waiting for the crash to stop.
+ *
+ * So this recognises the echo by what it is rather than by what we have had
+ * time to write down. Two signals, both required: porter comments AS the
+ * community that owns the wall, and every comment it mirrors carries the
+ * marker. A person writing as the community is not us, and neither is a person
+ * who happened to type the marker.
+ *
+ * A delete carries no text, so it falls through and still reaches Telegram —
+ * removing a mirrored comment in VK should remove the Telegram side too. An
+ * edit of our own echo does carry the marker and is skipped, which is also
+ * right: that row points at the Telegram author's own message, and a VK
+ * moderator retyping the mirror must not rewrite what somebody else wrote.
+ */
+function isOwnEcho(reply: CommentContext): boolean {
+  return (
+    reply.fromId != null &&
+    reply.fromId === reply.ownerId &&
+    (reply.text ?? "").includes(TG_PORT_MARKER)
+  );
+}
+
 /** Resolve the best photo URL from a VK photo attachment (null-safe). */
 function photoUrl(att: PhotoAttachment): string | null {
   return att.largeSizeUrl ?? att.mediumSizeUrl ?? att.smallSizeUrl ?? null;
@@ -161,6 +197,15 @@ export default async function replyToTelegram(reply: CommentContext): Promise<vo
     logtype: "raw context",
     reply: reply.toJSON(),
   });
+
+  // Before anything else, and before any await: a comment we wrote ourselves
+  // must not be carried back into the thread it came from.
+  if (isOwnEcho(reply)) {
+    logger.debug(
+      `[VK -> TG] Skipping our own echo of a Telegram comment: ${reply.id}`,
+    );
+    return;
+  }
 
   try {
     const post = await Post.findOne({

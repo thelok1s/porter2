@@ -5,6 +5,15 @@ import { Reply as ReplyModel } from "@/models/reply.schema";
 import type { Message } from "grammy/types";
 
 /**
+ * The line porter appends to every comment it mirrors from Telegram into VK.
+ *
+ * Also read by the VK → TG direction, which uses it to recognise its own echo
+ * and refuse to carry it back (see `replies.ts`). Both directions must agree on
+ * this string, so neither of them spells it out itself.
+ */
+export const TG_PORT_MARKER = "(Автоматически перенесено из tg)";
+
+/**
  * Strip Telegram HTML to plain text for VK (VK uses its own [url|text] markup).
  */
 function formatTelegramToVkText(text: string): string {
@@ -59,7 +68,7 @@ export async function replyToVk(
     }
 
     const processedText = formatTelegramToVkText(text);
-    const commentText = `${userDisplayName}(${userLink}): ${processedText}\n\n(Автоматически перенесено из tg)`;
+    const commentText = `${userDisplayName}(${userLink}): ${processedText}\n\n${TG_PORT_MARKER}`;
 
     // Create the VK comment (post as the group when the owner is a group)
     const vkComment = await vkGlobalApi.wall.createComment({
