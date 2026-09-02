@@ -68,17 +68,42 @@ composer.on("message", async (ctx, next) => {
         // P0-3: match against the full tg_ids[] array, not just tg_id. The
         // legacy query matched tg_id only (the first message of a group), so
         // multi-message posts never linked.
-        const candidates = await Post.findAll({
-          where: { discussion_tg_id: null },
-          attributes: ["vk_id", "tg_id", "tg_ids"],
+        //
+        // Every post, not only the unlinked ones, because "no unlinked post
+        // matches" answers two very different questions with one warning:
+        // whether this forward is ours at all, and whether it is one we have
+        // already dealt with. Only the second is worth raising a voice about.
+        const posts = await Post.findAll({
+          attributes: ["vk_id", "tg_id", "tg_ids", "discussion_tg_id"],
         });
-        const match = candidates.find(
+        const owner = posts.find(
           (p) =>
             p.tg_id === fwdId ||
             (Array.isArray(p.tg_ids) && p.tg_ids.includes(fwdId)),
         );
+        const match = owner && owner.discussion_tg_id == null ? owner : null;
 
-        if (match) {
+        if (!match) {
+          if (!owner) {
+            // Someone wrote in the channel by hand. That auto-forwards exactly
+            // like a ported post does, and there is no VK post behind it to
+            // attach — ordinary activity, which used to be logged as a fault
+            // (four such warnings in app.log over five days, all benign).
+            logger.debug(
+              `[Auto-forward] channel msg ${fwdId} was not ported by porter — ` +
+                "nothing to link",
+            );
+          } else {
+            logger.warn(
+              `[Auto-forward] channel msg ${fwdId} (vk_id ${owner.vk_id}) is ` +
+                `already linked to discussion msg ${owner.discussion_tg_id}; ` +
+                `ignoring the forward at ${msg.message_id}`,
+            );
+          }
+          return next();
+        }
+
+        {
           // Update by the immutable natural key vk_id (NOT an instance save) —
           // the candidates query selects only vk_id/tg_id/tg_ids, so the Post
           // instance has no `id` PK loaded and instance.update() would refuse.
@@ -91,10 +116,6 @@ composer.on("message", async (ctx, next) => {
           );
           // P0-4: flush any comments that were waiting for this linkage.
           await drainPendingForPost(match.vk_id);
-        } else {
-          logger.warn(
-            `[Auto-forward] No unlinked post matches channel msg ${fwdId} (discussion msg ${msg.message_id})`,
-          );
         }
       }
       return next();
